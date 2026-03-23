@@ -14,7 +14,7 @@ Two passes are run:
           NOTE: pass 2 tok/s is slower than reality due to forced sync overhead
 
 Usage:
-  PYTHONPATH=/path/to/MLX .venv/bin/python3 scripts/profile_bottleneck.py \\
+  poetry run python benchmarks/profile_bottleneck.py \\
       --model <model_path> --index <index_path> --native-reader <dylib_path> \\
       [--k 4] [--max-tokens 64] [--cache] [--window-tokens 2]
 """

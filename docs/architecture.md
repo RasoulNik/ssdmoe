@@ -1,71 +1,51 @@
-# Streamed Server Architecture
+# Server Architecture
 
-Goal:
-- use `mlx_lm.server` as the structural reference
-- keep the custom streamed MoE runtime as the generation backend
-- make OpenAI-compatible behavior an explicit protocol layer rather than mixed into inference code
+## Design goals
 
-Modules:
-- `streaming_qwen/server/protocol.py`
-  - request normalization
-  - capability validation
-  - OpenAI-style error envelopes
-  - response builders for chat completions and streaming chunks
-- `streaming_qwen/server/runtime_adapter.py`
-  - owns model/session lifecycle
-  - warms the model
-  - owns the in-memory LRU prompt/KV cache budget
-  - exposes model id and system fingerprint
-- `streaming_qwen/server/http.py`
-  - HTTP handler and server bootstrap
-  - request parsing and dispatch
-  - non-stream and SSE chat flows
-  - prompt-prefix checkpointing for non-trimmable MLX `ArraysCache`
-- `scripts/streamed_qwen_server.py`
-  - thin entrypoint only
+- Custom OpenAI-compatible HTTP server (not built on `mlx_lm.server`) to support
+  persistent cross-restart KV caching, tool calling, and multi-turn prefix sharing
+- Keep the custom streamed MoE runtime as the generation backend
+- Make OpenAI-compatible behaviour an explicit protocol layer, separated from inference code
 
-Why this structure:
-- mirrors the separation in `mlx_lm.server` between request handling, generation, and response formatting
-- keeps future work local to clear boundaries
-- makes it possible to add `tools`, `response_format`, and `/v1/responses` without touching the streamed expert runtime
+## Module map
 
-Current caching behavior:
-- the server keeps a bounded in-memory `LRUPromptCache`
-- Qwen 3.5 on current MLX uses non-trimmable `ArraysCache`, so storing only
-  `prompt + completion` KV state is not enough for prompt-prefix reuse
-- the server therefore saves an explicit checkpoint for `prompt[:-1]` during
-  prefill, which allows later requests to reuse all but the last prompt token
-- the end result is visible in API usage as `prompt_tokens_details.cached_tokens`
+| Module | Location | Role |
+|--------|----------|------|
+| `protocol.py` | `src/streaming_qwen/server/` | Request normalisation, capability validation, OpenAI error envelopes, response builders for chat completions and SSE chunks |
+| `runtime_adapter.py` | `src/streaming_qwen/server/` | Model and session lifecycle, model warm-up, in-memory LRU KV cache budget, model ID and system fingerprint |
+| `http.py` | `src/streaming_qwen/server/` | HTTP handler and server bootstrap, request dispatch, non-stream and SSE chat flows, prompt-prefix checkpointing, tool-call emission |
+| `persistent_cache.py` | `src/streaming_qwen/server/` | Disk KV cache: safetensors checkpoints, LRU eviction, deferred flush, end-of-turn checkpoint for multi-turn prefix sharing |
+| `streamed_qwen_server.py` | `scripts/` | Thin entrypoint: arg parsing + `run_server()` |
 
-Current client-compatibility behavior:
+## KV cache: why two checkpoints per turn
 
-- if a request omits `max_tokens`, the server falls back to its configured default
-- SSE streaming emits incremental content chunks, a final finish chunk, an
-  optional usage chunk, and then `[DONE]`
-- if the model keeps generating invisible template debris after producing visible
-  output, the server stops after a bounded visible-stall window so chat clients
-  do not hang waiting for a clean stop
-- this is enough for the minimal `opencode run` path with an OpenAI-compatible
-  provider config
+Qwen3's chat template injects `<think>\n\n</think>\n\n` tokens into the generation
+prompt when `enable_thinking=False`, but omits them from the history encoding of
+completed turns. This creates a token-sequence mismatch: the cache key for turn N
+(which includes the injected tokens) does not match turn N+1's prompt prefix.
 
-Next feature branches:
-1. Tool calling
-- add tokenizer capability discovery on startup
-- extend request parser for `tools`, `tool_choice`, and `tool` role messages
-- add streamed and non-stream `tool_calls` payload emission
-- likely borrow the parsing pattern from `mlx_lm.server`
+The server stores two checkpoints after each generation:
+1. **Generation cache** — keyed to the full token sequence including injected tokens.
+   Used if the exact same generation is re-issued.
+2. **End-of-turn checkpoint** — keyed to how this turn will appear in future history
+   (without the injected tokens). Used by turn N+1 to get a 97%+ prefix hit.
 
-2. Structured outputs
-- enable `json_object`
-- then add `json_schema` validation/retry policy
-- reject unsupported strict schemas explicitly
+The end-of-turn checkpoint is stored *before* `insert_cache` is called, because
+`insert_cache` can evict the oldest checkpoint (the system+tools base) from memory.
 
-3. Responses API
-- add `/v1/responses` as a translation layer on top of the same runtime adapter
-- share the same capability registry and output builders
+## Prefill loop
 
-4. Better client fidelity
-- richer error types
-- optional logprobs
-- more content-part support
-- request tracing and optional metrics hooks
+The server prefills the prompt in `PREFILL_STEP_SIZE`-token chunks (default 4096)
+rather than passing the full prompt to `stream_generate`, because MLX's lazy
+evaluation accumulates intermediate Metal buffers across all 94 layers until
+`mx.eval()` is called. Chunking + `mx.clear_cache()` between chunks bounds peak
+Metal memory to ~5.3 GB for a 4096-token chunk on a 16 GB machine.
+
+## Implemented capabilities
+
+- Streaming SSE and non-streaming chat completions
+- Tool calling (OpenAI-compatible `tool_calls` + `tool` role messages)
+- Multi-turn conversation with persistent disk KV cache (survives server restart)
+- `cached_tokens` in usage response
+- Configurable visible-stall guard (stops generation after N invisible tokens)
+- `-nothink` model ID suffix to disable thinking mode per request

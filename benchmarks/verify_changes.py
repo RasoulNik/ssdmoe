@@ -15,7 +15,7 @@ Test C — ExpertStore batch-read: native dispatch_apply vs Python ThreadPool
   Metric: GB/s for reading one layer's experts
 
 Usage:
-  PYTHONPATH=/path/to/MLX .venv/bin/python3 scripts/verify_changes.py \
+  poetry run python benchmarks/verify_changes.py \
       --model <model_path> --index <index_path> --native-reader <dylib_path>
 """
 from __future__ import annotations

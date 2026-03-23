@@ -56,10 +56,10 @@ For Qwen 3.5 35B A3B, the official routing config is `8 activated experts per to
 ## Completed work
 
 1. Cloned `flash-moe` locally for direct reference.
-2. Documented the machine-specific throughput ceiling in `docs/streaming-qwen35b-assessment.md`.
-3. Added `scripts/build_qwen_moe_index.py` to generate a flash-moe-style expert byte index from original safetensors shards.
-4. Added `streaming_qwen/expert_store.py` to read experts by byte offset with `pread()`.
-5. Added `scripts/pread_expert_bench.py` to benchmark routed expert reads directly.
+2. Documented the machine-specific throughput ceiling in `docs/assessment.md`.
+3. Added `tools/build_qwen_moe_index.py` to generate a flash-moe-style expert byte index from original safetensors shards.
+4. Added `src/streaming_qwen/expert_store.py` to read experts by byte offset with `pread()`.
+5. Added `benchmarks/pread_expert_bench.py` to benchmark routed expert reads directly.
 6. Added selective tensor loading utilities to load only non-expert text weights from safetensors.
 7. Built a working streamed Qwen 3.5 generation path and benchmark harness.
 8. Added a native Objective-C expert read benchmark in `native/expert_read_bench.m`.
@@ -144,7 +144,7 @@ Result:
 
 Comparison on the same layer-0, `K=8` expert payload:
 
-- Python benchmark: `scripts/pread_expert_bench.py`
+- Python benchmark: `benchmarks/pread_expert_bench.py`
 - native benchmark: `native/expert_read_bench.m`
 
 Observed after a warm-cache rebooted run:
@@ -188,7 +188,7 @@ The earlier anomalous `K=3` and `K=2` numbers turned out to be a methodology pro
 - a multi-`K` sweep warms the page cache and compiled execution paths as it progresses
 - later entries in the sweep can look much faster than a fresh single-`K` run
 
-I added explicit warmup support to `scripts/stream_qwen_bench.py`:
+I added explicit warmup support to `benchmarks/stream_qwen_bench.py`:
 
 - `--warmup-tokens`
 - `--warmup-prompt`
@@ -439,7 +439,7 @@ Key findings:
 Implemented pipelined I/O that overlaps expert loading with shared_expert computation.
 
 New files:
-- `streaming_qwen/pipelined_moe.py`
+- `src/streaming_qwen/pipelined_moe.py`
 
 Key design:
 1. Start expert I/O in background thread
@@ -584,7 +584,7 @@ Artifacts:
 Benchmark setup:
 
 - new serial native reader: `native/expert_reader_serial.c`
-- layer-load harness: `scripts/bench_component_loading.py`
+- layer-load harness: `benchmarks/bench_component_loading.py`
 - all `40` text layers
 - `5` full sweeps per mode
 - compares:
@@ -676,15 +676,15 @@ Implementation:
 
 Files changed:
 
-- `streaming_qwen/server/http.py`
-- `streaming_qwen/server/runtime_adapter.py`
-- `streaming_qwen/server/protocol.py`
+- `src/streaming_qwen/server/http.py`
+- `src/streaming_qwen/server/runtime_adapter.py`
+- `src/streaming_qwen/server/protocol.py`
 - `scripts/streamed-qwen-server.sh`
 - `scripts/streamed-chat.sh`
 - `configs/opencode-streamed-simple.json`
 - `scripts/opencode-streamed-simple.sh`
-- `docs/streamed-chat-ui.md`
-- `docs/streamed-server-architecture.md`
+- `docs/chat-ui.md`
+- `docs/architecture.md`
 
 Direct runtime check after switching to `K=4`:
 
@@ -748,10 +748,10 @@ Files changed:
 - `opencode.json`
 - `configs/opencode-streamed-simple.json`
 - `scripts/opencode-streamed-simple.sh`
-- `streaming_qwen/server/http.py`
-- `streaming_qwen/server/protocol.py`
-- `docs/streamed-chat-ui.md`
-- `docs/streamed-server-architecture.md`
+- `src/streaming_qwen/server/http.py`
+- `src/streaming_qwen/server/protocol.py`
+- `docs/chat-ui.md`
+- `docs/architecture.md`
 
 Verification:
 
@@ -866,9 +866,9 @@ Implementation:
 - created branch:
   - `exp/speculative-prefetch-limits`
 - added lightweight expert-selection tracing in:
-  - `streaming_qwen/streamed_switch.py`
+  - `src/streaming_qwen/streamed_switch.py`
 - added study harness:
-  - `scripts/speculative_cache_study.py`
+  - `benchmarks/speculative_cache_study.py`
 - the study:
   - performs a real decode trace with selected experts recorded per layer
   - simulates sliding reuse windows `H=1/2/3`
@@ -1018,12 +1018,12 @@ Goal:
 Implementation:
 
 - added exact per-layer rolling expert reuse to:
-  - `streaming_qwen/streamed_switch.py`
+  - `src/streaming_qwen/streamed_switch.py`
 - added runtime control hooks in:
-  - `streaming_qwen/runtime.py`
+  - `src/streaming_qwen/runtime.py`
 - added server/session control for decode-only activation in:
-  - `streaming_qwen/server/runtime_adapter.py`
-  - `streaming_qwen/server/http.py`
+  - `src/streaming_qwen/server/runtime_adapter.py`
+  - `src/streaming_qwen/server/http.py`
 - added server flags and wrapper defaults in:
   - `scripts/streamed-qwen-server.sh`
 
@@ -1203,7 +1203,7 @@ measured as a stack.
 
 All numbers below are **decode-only tok/s** (autoregressive generation, skip first 3
 tokens for JIT warmup, SSD stats reset after prefill).  Measurement harness:
-`scripts/verify_changes.py`.  Model: `Qwen3.5-35B-A3B-4bit`, `K=4`, `H=2`.
+`benchmarks/verify_changes.py`.  Model: `Qwen3.5-35B-A3B-4bit`, `K=4`, `H=2`.
 
 ---
 
@@ -1224,8 +1224,8 @@ many components or experts are involved.
 **Files changed:**
 
 - `native/expert_io.c` — added `read_component_batches`
-- `streaming_qwen/native_reader.py` — added ctypes binding
-- `streaming_qwen/expert_store.py` — `read_components_batched` now calls the
+- `src/streaming_qwen/native_reader.py` — added ctypes binding
+- `src/streaming_qwen/expert_store.py` — `read_components_batched` now calls the
   single-call C path
 
 **Measured result (Test C, microbenchmark, 7.1 MB per call, K=4):**
@@ -1262,8 +1262,8 @@ Python-side implementation paid three compounding costs per layer-call:
 **Files changed:**
 
 - `native/expert_mem.c` — `alloc_slab`, `free_slab`, `copy_experts_multi`
-- `streaming_qwen/native_reader.py` — `NativeSlab`, ctypes bindings for all three
-- `streaming_qwen/session_window_cache.py` — `SessionState.expert_lut`, slab-based `LayerWindow`, rewritten `load_components_for_layer`
+- `src/streaming_qwen/native_reader.py` — `NativeSlab`, ctypes bindings for all three
+- `src/streaming_qwen/session_window_cache.py` — `SessionState.expert_lut`, slab-based `LayerWindow`, rewritten `load_components_for_layer`
 
 **C/Python boundary contract per layer-call (after):**
 
@@ -1298,7 +1298,7 @@ section below.
 independent linear projections on the same input that could be expressed as a
 single operation.
 
-**Fix.**  `streaming_qwen/fused_expert.py` provides `compute_expert_output_fused`
+**Fix.**  `src/streaming_qwen/fused_expert.py` provides `compute_expert_output_fused`
 which calls `fused_gate_up_swiglu`: one function that performs both gather_qmm
 calls and the swiglu activation before handing off to the down projection.
 `StreamedSwitchGLU` exposes `fused_gate_up` and `compile_fused_gate_up` flags; the
@@ -1314,9 +1314,9 @@ compatibility.
 
 **Files changed:**
 
-- `streaming_qwen/fused_expert.py` — `fused_gate_up_swiglu`, `compute_expert_output_fused`
-- `streaming_qwen/streamed_switch.py` — `fused_gate_up` / `compile_fused_gate_up` wiring
-- `streaming_qwen/pipelined_moe.py`, `prefetch_switch.py` — same wiring
+- `src/streaming_qwen/fused_expert.py` — `fused_gate_up_swiglu`, `compute_expert_output_fused`
+- `src/streaming_qwen/streamed_switch.py` — `fused_gate_up` / `compile_fused_gate_up` wiring
+- `src/streaming_qwen/pipelined_moe.py`, `prefetch_switch.py` — same wiring
 
 **Measured result (Test B, end-to-end decode, K=4, no cache):**
 
@@ -1401,12 +1401,12 @@ Implementation:
 
 Files changed:
 
-- `streaming_qwen/server/protocol.py` — added `parse_tool_calls()` (XML regex parser),
+- `src/streaming_qwen/server/protocol.py` — added `parse_tool_calls()` (XML regex parser),
   `tools` field on `ChatRequest`, `normalize_messages()` now repairs `arguments` from
   JSON string to dict, `prompt_from_messages()` / `prompt_tokens_from_messages()` pass
   `tools=` kwarg to the chat template, `ChatResponseBuilder.chat_completion()` accepts
   `tool_calls=`
-- `streaming_qwen/server/http.py` — `ServerCapabilities(tools=True)`, `-nothink` model
+- `src/streaming_qwen/server/http.py` — `ServerCapabilities(tools=True)`, `-nothink` model
   suffix detection (sets `enable_thinking=False` without changing the model), stall limit
   bypass for tool requests, post-generation tool-call delta emission in streaming mode
 - `opencode.json` — added `streamed-qwen-k4-nothink` model, added `code` agent with
@@ -1441,11 +1441,11 @@ Design:
 
 Files changed:
 
-- `streaming_qwen/server/persistent_cache.py` (new) — `PersistentPromptCache` wrapping
+- `src/streaming_qwen/server/persistent_cache.py` (new) — `PersistentPromptCache` wrapping
   `LRUPromptCache` with async safetensors save, `load_from_disk()`, `_evict_disk()`
-- `streaming_qwen/server/runtime_adapter.py` — replaced `LRUPromptCache` with
+- `src/streaming_qwen/server/runtime_adapter.py` — replaced `LRUPromptCache` with
   `PersistentPromptCache`, added `load_from_disk()` in `warmup()`, added `close()`
-- `streaming_qwen/server/http.py` — added `--kv-cache-dir` (default `.run/kv-cache`)
+- `src/streaming_qwen/server/http.py` — added `--kv-cache-dir` (default `.run/kv-cache`)
   and `--kv-cache-disk-bytes` server flags
 
 Key engineering note — Metal assertion crash fixed:
