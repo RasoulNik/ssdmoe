@@ -3,7 +3,7 @@ name = "streaming-qwen-server"
 version = "0.1.0"
 description = "Qwen3.5-35B MoE streaming inference server — runs 35B on 16 GB via on-demand expert loading"
 authors = [
-    {name = "Rasoul", email = ""}
+    {name = "Rasoul"}
 ]
 readme = "README.md"
 requires-python = ">=3.10,<4.0"

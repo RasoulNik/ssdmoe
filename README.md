@@ -7,18 +7,26 @@ via on-demand expert streaming — no full model load into RAM, no second copy o
 
 | Metric | Result |
 |--------|--------|
-| Decode throughput (K=4) | **10–12 tok/s** |
-| Prefill speed — cold start | ~40 tok/s |
-| Prefill speed — KV cache hit | ~22–27 tok/s |
-| Multi-turn KV cache hit rate | **97%+** |
-| Active memory footprint | ~1–2 GB |
-| Full model size (reference) | 18.5 GB |
+| Decode throughput (K=4, fresh process) | **7–8 tok/s** |
+| Decode throughput (K=4, warm server) | **10–12 tok/s** |
+| Prefill speed — cold start (bench) | ~75 tok/s |
+| Prefill speed — server (with step overhead) | ~38 tok/s |
+| Multi-turn KV cache hit rate | **97–98%+** |
+| Active memory (server runtime) | ~1 GB |
+| Peak memory (during prefill) | ~2.5 GB |
+| Full model size on disk | ~19 GB |
 
 Platform: Apple M4 MacBook Air, 16 GB unified memory, internal SSD (~5.6 GB/s sustained read).
 
+> Decode throughput scales with OS page cache warmth. A freshly started process reads
+> expert shards from SSD on every token (~7–8 tok/s). After a long-running session, the
+> OS has hot-cached frequently used expert shards in RAM, reaching 10–12 tok/s.
+> The server step overhead in prefill (intermediate `mx.clear_cache()` calls between
+> 1024-token chunks) halves raw prefill throughput vs the bench script.
+
 ## Architecture
 
-Standard `mlx-lm` loads all 18.5 GB of model weights into RAM before the first token.
+Standard `mlx-lm` loads all ~19 GB of model weights into RAM before the first token.
 This server loads only the **K routed expert shards** needed for each forward pass, reading
 them directly from the Hugging Face safetensors files on SSD with `pread()`.
 
