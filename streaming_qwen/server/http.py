@@ -24,6 +24,7 @@ from .protocol import (
     build_request_id,
     error_payload,
     now_s,
+    parse_tool_calls,
     prompt_tokens_from_messages,
     trim_stop,
     usage_payload,
@@ -125,6 +126,16 @@ def parse_args() -> argparse.Namespace:
         "--warmup-prompt",
         default="Hello",
         help="Warmup prompt text",
+    )
+    parser.add_argument(
+        "--kv-cache-dir",
+        default=".run/kv-cache",
+        help="Directory for persistent KV cache (safetensors). Empty string to disable.",
+    )
+    parser.add_argument(
+        "--kv-cache-disk-bytes",
+        default="0",
+        help="Disk KV cache budget, e.g. 5G. 0 = 5× --prompt-cache-bytes.",
     )
     parser.add_argument(
         "--enable-thinking",
@@ -337,18 +348,25 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
 
     def _generate(self, request):
         session = self._session()
+        # Model ID suffix "-nothink" disables thinking for that request,
+        # allowing opencode to select fast-no-think mode via model name.
+        enable_thinking = self._args().enable_thinking
+        if request.model.endswith("-nothink"):
+            enable_thinking = False
         prompt_tokens = prompt_tokens_from_messages(
             session.tokenizer,
             request.messages,
-            enable_thinking=self._args().enable_thinking,
+            enable_thinking=enable_thinking,
             chat_template_kwargs=request.chat_template_kwargs,
+            tools=request.tools,
         )
         conversation_tokens = prompt_tokens_from_messages(
             session.tokenizer,
             request.messages,
-            enable_thinking=self._args().enable_thinking,
+            enable_thinking=enable_thinking,
             add_generation_prompt=False,
             chat_template_kwargs=request.chat_template_kwargs,
+            tools=request.tools,
         )
         sampler = self._make_sampler(request)
         with session.lock:
@@ -361,12 +379,70 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
             if cache is None:
                 cache = make_prompt_cache(session.model)
             prefilled_tokens = 0
+
+            # --- System-prefix checkpoint ---
+            # Tokenize only the system message(s) (plus tools, which the Qwen3.5
+            # template appends to the system block).  This prefix is identical
+            # across every session that uses the same agent configuration, so
+            # caching it lets fetch_nearest_cache return ~4 k cached tokens even
+            # when the user message differs between sessions.
+            system_messages = [m for m in request.messages if m["role"] == "system"]
+            if system_messages:
+                try:
+                    # Qwen3.5's template requires a user message; pass two dummy
+                    # variants and find the common prefix — that prefix is exactly
+                    # the system block (including tool definitions appended by the
+                    # template).  Any request with the same system config shares
+                    # this prefix regardless of the actual user message.
+                    _dummy_base = dict(chat_template_kwargs=request.chat_template_kwargs,
+                                       tools=request.tools,
+                                       enable_thinking=enable_thinking,
+                                       add_generation_prompt=False)
+                    _d1 = system_messages + [{"role": "user", "content": ""}]
+                    _d2 = system_messages + [{"role": "user", "content": "."}]
+                    _t1 = prompt_tokens_from_messages(session.tokenizer, _d1, **_dummy_base)
+                    _t2 = prompt_tokens_from_messages(session.tokenizer, _d2, **_dummy_base)
+                    sys_len = next(
+                        (i for i, (a, b) in enumerate(zip(_t1, _t2)) if a != b),
+                        min(len(_t1), len(_t2)),
+                    )
+                    system_tokens = _t1[:sys_len]
+                except Exception:
+                    system_tokens = []  # skip if template behaves unexpectedly
+                    sys_len = 0
+                else:
+                    sys_len = len(system_tokens)
+                if (
+                    cached_tokens < sys_len < len(conversation_tokens)
+                    and prompt_tokens[:sys_len] == system_tokens
+                ):
+                    sys_gap = sys_len - cached_tokens
+                    sys_prefix = rest[:sys_gap]
+                    if sys_prefix:
+                        self._prefill_prompt_prefix(
+                            tokens=sys_prefix,
+                            cache=cache,
+                            step_size=self._args().prefill_step_size,
+                            model=session.model,
+                            session=session,
+                            top_k=session.prefill_top_k,
+                        )
+                        session.prompt_cache.insert_cache(
+                            session.cache_namespace,
+                            list(system_tokens),
+                            copy.deepcopy(cache),
+                            checkpoint=True,
+                        )
+                        rest = rest[sys_gap:]
+                        prefilled_tokens = sys_gap
+
+            # --- Conversation-prefix checkpoint (system + all messages except gen prompt) ---
             reusable_checkpoint_len = len(conversation_tokens)
             if (
-                cached_tokens < reusable_checkpoint_len < len(prompt_tokens)
+                cached_tokens + prefilled_tokens < reusable_checkpoint_len < len(prompt_tokens)
                 and prompt_tokens[:reusable_checkpoint_len] == conversation_tokens
             ):
-                gap = reusable_checkpoint_len - cached_tokens
+                gap = reusable_checkpoint_len - (cached_tokens + prefilled_tokens)
                 prefix = rest[:gap]
                 if prefix:
                     self._prefill_prompt_prefix(
@@ -384,7 +460,7 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                         checkpoint=True,
                     )
                     rest = rest[gap:]
-                    prefilled_tokens = gap
+                    prefilled_tokens += gap
             prompt_checkpoint_saved = False
 
             if len(rest) > 1:
@@ -441,6 +517,10 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
             finally:
                 session.set_top_k(session.decode_top_k)
                 session.prompt_cache.insert_cache(session.cache_namespace, cache_key, cache)
+                # Flush queued checkpoint saves NOW — inference is done, Metal is idle.
+                # save_prompt_cache issues Metal GPU→CPU blits; running it here (on the
+                # handler thread, after stream_generate) avoids concurrent Metal access.
+                session.prompt_cache.flush_pending_saves()
                 session.prompt_cache.log_cache_stats()
         return {
             "prompt_tokens": len(prompt_tokens),
@@ -469,7 +549,13 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                 break
         if final_response is None:
             raise RuntimeError("Generation produced no response")
-        finish_reason = "stop" if emitted_text != full_text else final_response.finish_reason
+        tool_calls = parse_tool_calls(full_text) if request.tools else None
+        if tool_calls:
+            finish_reason = "tool_calls"
+            content = None
+        else:
+            finish_reason = "stop" if emitted_text != full_text else final_response.finish_reason
+            content = emitted_text
         usage = usage_payload(
             final_response,
             prompt_tokens=generation_meta["prompt_tokens"],
@@ -479,9 +565,10 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
             request_id=request_id,
             created=created,
             model=request.model,
-            content=emitted_text,
+            content=content,
             finish_reason=finish_reason,
             usage=usage,
+            tool_calls=tool_calls,
         )
         self._send_json(
             payload,
@@ -533,7 +620,10 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                 stalled_visible_tokens = 0
             if stop_hit:
                 break
-            if emitted_text and stalled_visible_tokens >= self._args().visible_stall_tokens:
+            # Don't apply stall limit when tools are active: tool call XML is invisible
+            # by design and must complete before we can parse and emit it.
+            stall_limit = self._args().visible_stall_tokens if not request.tools else 2048
+            if emitted_text and stalled_visible_tokens >= stall_limit:
                 logging.info(
                     "Ending buffered stream after %s hidden/stalled tokens",
                     stalled_visible_tokens,
@@ -542,18 +632,54 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
 
         if final_response is None:
             raise RuntimeError("Generation produced no response")
-        finish_reason = "stop" if emitted_text != full_text else final_response.finish_reason
-        if not role_sent:
-            empty_chunk = self._responses().stream_chunk(
-                request_id=request_id,
-                created=created,
-                model=request.model,
-                delta={"role": "assistant", "content": ""},
-                finish_reason=None,
-                include_usage=request.include_usage,
-            )
-            if not self._write_sse_event(empty_chunk):
-                return
+        tool_calls = parse_tool_calls(full_text) if request.tools else None
+        if tool_calls:
+            # Emit role opener if not yet sent
+            if not role_sent:
+                role_chunk = self._responses().stream_chunk(
+                    request_id=request_id,
+                    created=created,
+                    model=request.model,
+                    delta={"role": "assistant", "content": None},
+                    finish_reason=None,
+                    include_usage=request.include_usage,
+                )
+                if not self._write_sse_event(role_chunk):
+                    return
+            # Emit one chunk per tool call
+            for i, tc in enumerate(tool_calls):
+                tc_chunk = self._responses().stream_chunk(
+                    request_id=request_id,
+                    created=created,
+                    model=request.model,
+                    delta={"tool_calls": [{
+                        "index": i,
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        },
+                    }]},
+                    finish_reason=None,
+                    include_usage=request.include_usage,
+                )
+                if not self._write_sse_event(tc_chunk):
+                    return
+            finish_reason = "tool_calls"
+        else:
+            finish_reason = "stop" if emitted_text != full_text else final_response.finish_reason
+            if not role_sent:
+                empty_chunk = self._responses().stream_chunk(
+                    request_id=request_id,
+                    created=created,
+                    model=request.model,
+                    delta={"role": "assistant", "content": ""},
+                    finish_reason=None,
+                    include_usage=request.include_usage,
+                )
+                if not self._write_sse_event(empty_chunk):
+                    return
         final_chunk = self._responses().stream_chunk(
             request_id=request_id,
             created=created,
@@ -606,7 +732,7 @@ def run_server(args: argparse.Namespace) -> None:
         default_temp=args.temp,
         default_top_p=args.top_p,
         capabilities=ServerCapabilities(
-            tools=False,
+            tools=True,
             responses_api=False,
             json_mode=False,
             structured_outputs=False,

@@ -6,10 +6,10 @@ import threading
 from pathlib import Path
 
 from mlx_lm.generate import stream_generate
-from mlx_lm.server import LRUPromptCache
 
 from streaming_qwen.runtime import build_streamed_model, set_routed_top_k
 
+from .persistent_cache import PersistentPromptCache
 from .protocol import build_system_fingerprint
 
 
@@ -54,14 +54,26 @@ class StreamedModelSession:
             str(self.model_path),
             args.routed_top_k,
         )
-        self.prompt_cache = LRUPromptCache(
+        mem_bytes = parse_size(args.prompt_cache_bytes)
+        kv_cache_dir_str = getattr(args, "kv_cache_dir", None) or ""
+        kv_cache_dir = (
+            Path(kv_cache_dir_str).expanduser().resolve()
+            if kv_cache_dir_str.strip()
+            else None
+        )
+        disk_bytes_str = getattr(args, "kv_cache_disk_bytes", "0") or "0"
+        disk_bytes = parse_size(disk_bytes_str) if disk_bytes_str.strip("0") else 0
+        self.prompt_cache = PersistentPromptCache(
             max_size=args.prompt_cache_size,
-            max_bytes=parse_size(args.prompt_cache_bytes),
+            max_bytes=mem_bytes,
+            disk_dir=kv_cache_dir,
+            disk_max_bytes=disk_bytes,  # 0 → 5× mem_bytes inside PersistentPromptCache
         )
         self.cache_namespace = (self.model_id, str(self.model_path))
         self.lock = threading.Lock()
 
     def close(self) -> None:
+        self.prompt_cache.close()
         prefetch_manager = getattr(self.expert_store, "prefetch_manager", None)
         if prefetch_manager is not None:
             prefetch_manager.shutdown()
@@ -71,6 +83,12 @@ class StreamedModelSession:
         set_routed_top_k(self.model, top_k)
 
     def warmup(self) -> None:
+        # Restore disk KV caches first so they're available before the first request.
+        n = self.prompt_cache.load_from_disk(self.cache_namespace)
+        if n:
+            logging.info("Loaded %d KV caches from disk (skipping GPU warmup)", n)
+            return
+
         if self.args.warmup_tokens <= 0:
             return
         logging.info(
