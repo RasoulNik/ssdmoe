@@ -31,6 +31,7 @@ class ChatRequest:
     stop_words: list[str]
     chat_template_kwargs: dict[str, Any] | None
     response_format: dict[str, Any] | None
+    session_id: str | None
 
 
 def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -243,6 +244,7 @@ class RequestParser:
             stop_words=stop_words,
             chat_template_kwargs=body.get("chat_template_kwargs"),
             response_format=response_format,
+            session_id=(str(body["session_id"]) if body.get("session_id") else None),
         )
 
 

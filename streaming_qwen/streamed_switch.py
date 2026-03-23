@@ -68,11 +68,10 @@ def _blob_to_mx(blob, info: dict, count: int) -> mx.array:
     raise ValueError(f"Unsupported streamed dtype: {dtype}")
 
 
-def _remap_indices(indices: mx.array, selected_experts: list[int]) -> mx.array:
-    mapping = {expert: i for i, expert in enumerate(selected_experts)}
-    indices_np = np.array(indices.tolist(), dtype=np.int32)
-    remapped = np.vectorize(mapping.__getitem__)(indices_np)
-    return mx.asarray(remapped.astype(np.int32))
+def _remap_indices(indices_np: np.ndarray, selected_np: np.ndarray) -> mx.array:
+    # searchsorted on a sorted K-element array — pure numpy, no Python dispatch per element
+    remapped = np.searchsorted(selected_np, indices_np).astype(np.int32)
+    return mx.asarray(remapped)
 
 
 def _compute_expert_output(
@@ -186,6 +185,12 @@ class StreamedSwitchGLU(nn.Module):
         self.session_cache = session_cache  # SessionWindowNativeCache | None
         self._cache: OrderedDict[tuple[int, int], tuple[dict[str, mx.array], int]] = OrderedDict()
         self._cache_bytes = 0
+        # Pre-compute per-layer constants so __call__ doesn't rebuild them every token
+        self._layer_info = expert_store.expert_reads[str(layer_idx)]
+        self._streamed_components = [
+            c for c in self._layer_info
+            if not expert_store.has_resident_component(layer_idx, c)
+        ]
 
     def _cache_get(self, expert_idx: int) -> dict[str, mx.array] | None:
         key = (self.layer_idx, expert_idx)
@@ -230,15 +235,12 @@ class StreamedSwitchGLU(nn.Module):
         return tensors, size_bytes
 
     def _load_selected(self, selected_experts: list[int]) -> dict[str, mx.array]:
-        layer_info = self.expert_store.expert_reads[str(self.layer_idx)]
+        layer_info = self._layer_info
+        streamed_components = self._streamed_components
 
         # Session-window cache path: handles both hits (copy) and misses (SSD read)
         # in a single call, storing results in a rolling token window.
         if self.session_cache is not None:
-            streamed_components = [
-                c for c in layer_info
-                if not self.expert_store.has_resident_component(self.layer_idx, c)
-            ]
             if streamed_components:
                 cached_mvs = self.session_cache.load_components_for_layer(
                     layer_idx=self.layer_idx,
@@ -266,14 +268,6 @@ class StreamedSwitchGLU(nn.Module):
                     return out
 
         if self.cache_limit_bytes <= 0:
-            resident_components = {
-                component: self.expert_store.get_resident_component(self.layer_idx, component)
-                for component in layer_info.keys()
-                if self.expert_store.has_resident_component(self.layer_idx, component)
-            }
-            streamed_components = [
-                component for component in layer_info.keys() if component not in resident_components
-            ]
             selected_indices = mx.array(selected_experts, dtype=mx.int32)
             if self.expert_store.native_reader is not None:
                 if streamed_components:
@@ -294,9 +288,9 @@ class StreamedSwitchGLU(nn.Module):
                 STREAM_STATS["load_seconds"] += time.perf_counter() - t0
             out = {}
             for component, info in layer_info.items():
-                if component in resident_components:
+                if self.expert_store.has_resident_component(self.layer_idx, component):
                     out[component] = mx.take(
-                        resident_components[component],
+                        self.expert_store.get_resident_component(self.layer_idx, component),
                         selected_indices,
                         axis=0,
                     )
@@ -348,13 +342,17 @@ class StreamedSwitchGLU(nn.Module):
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         STREAM_STATS["calls"] += 1
-        selected = sorted(set(int(v) for v in np.array(indices.tolist()).flatten()))
+        # Single GPU→CPU sync for the whole layer-call.
+        # np.unique returns a sorted array of distinct expert ids.
+        t0 = time.perf_counter()
+        indices_np = np.array(indices.tolist(), dtype=np.int32)
+        selected_np = np.unique(indices_np)          # sorted, no Python loop
+        selected = selected_np.tolist()
         STREAM_STATS["selected_experts_total"] += len(selected)
         if not selected:
             return mx.zeros((*x.shape[:-1], 0, x.shape[-1]), dtype=x.dtype)
-
-        t0 = time.perf_counter()
-        local_indices = _remap_indices(indices, selected)
+        # Remap: searchsorted on the K-element sorted selected_np — pure numpy
+        local_indices = _remap_indices(indices_np, selected_np)
         STREAM_STATS["remap_seconds"] += time.perf_counter() - t0
         tensors = self._load_selected(selected)
         return _compute_expert_output(
