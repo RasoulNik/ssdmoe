@@ -5,14 +5,15 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
-from .native_reader import NativeSlab
+import numpy as np
+import mlx.core as mx
 
 
 @dataclass
 class LayerWindow:
     expert_ids: list[int]
     slot_by_expert: dict[int, int]
-    slab: NativeSlab
+    tensors: dict[str, mx.array]   # {component: mx.array shape [K, ...]}
     total_bytes: int
 
 
@@ -38,6 +39,18 @@ class SessionState:
         if self.current is not None:
             total += self.current.total_bytes
         return total
+
+
+def _bytes_to_mx(blob, info: dict, count: int) -> mx.array:
+    component_shape = (count, *info["shape"][1:])
+    dtype = info["dtype"]
+    if dtype == "BF16":
+        raw = np.frombuffer(blob, dtype=np.uint16).reshape(component_shape)
+        return mx.view(mx.asarray(raw), mx.bfloat16)
+    if dtype == "U32":
+        raw = np.frombuffer(blob, dtype=np.uint32).reshape(component_shape)
+        return mx.asarray(raw)
+    raise ValueError(f"Unsupported dtype: {dtype}")
 
 
 class SessionWindowNativeCache:
@@ -131,10 +144,11 @@ class SessionWindowNativeCache:
         layer_info: dict,
         expert_store,
         streamed_components: list[str],
-    ) -> dict[str, memoryview] | None:
+    ) -> dict[str, mx.array] | None:
         with self._lock:
             if (
                 not self._enabled
+                or self._phase != "decode"
                 or self._active_session_id is None
                 or self.window_tokens <= 0
                 or not selected_experts
@@ -144,66 +158,81 @@ class SessionWindowNativeCache:
             if session is None:
                 return None
             session.last_access = time.time()
-            if self._phase == "decode" and session.current is None:
+            if session.current is None:
                 session.current = TokenWindow()
 
-            count = len(selected_experts)
-            nr = expert_store.native_reader
-            expert_sizes_by_comp = {
-                c: int(layer_info[c]["expert_size"]) for c in streamed_components
-            }
-            # Step 2: single aligned slab for all components
-            slab = nr.alloc_slab(
-                components=streamed_components,
-                sizes={c: expert_sizes_by_comp[c] * count for c in streamed_components},
-            )
-
-            # Step 1: O(1) LUT lookup; group hits by source LayerWindow
-            # hits_by_window: id(lw) -> (lw, src_slots, dst_slots)
-            hits_by_window: dict[int, tuple[LayerWindow, list[int], list[int]]] = {}
+            # O(1) LUT: classify each expert as hit or miss
+            hit_map: dict[int, tuple[LayerWindow, int]] = {}  # expert_id -> (lw, src_slot)
             missing_experts: list[int] = []
-            missing_slots: list[int] = []
-
-            for out_slot, expert_idx in enumerate(selected_experts):
-                hit = session.expert_lut.get((layer_idx, expert_idx))
-                if hit is None:
-                    missing_experts.append(expert_idx)
-                    missing_slots.append(out_slot)
-                    continue
-                layer_window, source_slot = hit
-                self._hit_experts += 1
-                lw_id = id(layer_window)
-                if lw_id not in hits_by_window:
-                    hits_by_window[lw_id] = (layer_window, [], [])
-                hits_by_window[lw_id][1].append(source_slot)
-                hits_by_window[lw_id][2].append(out_slot)
-
-        # --- released lock for I/O and copy ---
-
-        if missing_experts:
-            expert_store.read_components_batched_into_slots(
-                layer_idx,
-                missing_experts,
-                missing_slots,
-                {c: slab.component_ptr(c) for c in streamed_components},
-                components=streamed_components,
-            )
-
-        if hits_by_window:
-            # Step 3: single C call per unique source window (1 call in common case)
-            dst_ptrs = [slab.component_ptr(c) for c in streamed_components]
-            esizes = [expert_sizes_by_comp[c] for c in streamed_components]
-            for lw, src_slots_grp, dst_slots_grp in hits_by_window.values():
-                nr.copy_experts_multi(
-                    src_ptrs=[lw.slab.component_ptr(c) for c in streamed_components],
-                    dst_ptrs=dst_ptrs,
-                    expert_sizes=esizes,
-                    src_slots=src_slots_grp,
-                    dst_slots=dst_slots_grp,
-                )
-
-        with self._lock:
+            missing_dst_slots: list[int] = []
+            for dst_slot, expert_id in enumerate(selected_experts):
+                entry = session.expert_lut.get((layer_idx, expert_id))
+                if entry is None:
+                    missing_experts.append(expert_id)
+                    missing_dst_slots.append(dst_slot)
+                else:
+                    hit_map[expert_id] = entry
+                    self._hit_experts += 1
             self._miss_experts += len(missing_experts)
+
+        # --- lock released: do I/O for misses ---
+
+        miss_tensors: dict[str, mx.array] = {}
+        if missing_experts:
+            payload = expert_store.read_components_batched(
+                layer_idx, missing_experts, components=streamed_components
+            )
+            for c in streamed_components:
+                miss_tensors[c] = _bytes_to_mx(payload[c], layer_info[c], len(missing_experts))
+
+        # Assemble output dict[str, mx.array] in selected_experts order
+        out: dict[str, mx.array] = {}
+        selected_mx = mx.array(selected_experts, dtype=mx.int32)
+
+        for component, info in layer_info.items():
+            if expert_store.has_resident_component(layer_idx, component):
+                out[component] = mx.take(
+                    expert_store.get_resident_component(layer_idx, component),
+                    selected_mx,
+                    axis=0,
+                )
+                continue
+
+            if not hit_map:
+                # All misses — use directly
+                out[component] = miss_tensors[component]
+
+            elif not missing_experts:
+                # All hits — gather from cached mx.arrays, no I/O, no copy
+                unique_windows = {id(hit_map[e][0]) for e in selected_experts}
+                if len(unique_windows) == 1:
+                    # Single source window: one mx.take
+                    lw = hit_map[selected_experts[0]][0]
+                    src_slots = mx.array(
+                        [hit_map[e][1] for e in selected_experts], dtype=mx.int32
+                    )
+                    out[component] = mx.take(lw.tensors[component], src_slots, axis=0)
+                else:
+                    # Multiple source windows: stack row by row (K=4 iterations, all lazy)
+                    rows = [hit_map[e][0].tensors[component][hit_map[e][1]]
+                            for e in selected_experts]
+                    out[component] = mx.stack(rows, axis=0)
+
+            else:
+                # Mixed hits and misses: interleave in selected_experts order
+                rows = []
+                miss_idx = 0
+                for e in selected_experts:
+                    if e in hit_map:
+                        lw, src_slot = hit_map[e]
+                        rows.append(lw.tensors[component][src_slot])
+                    else:
+                        rows.append(miss_tensors[component][miss_idx])
+                        miss_idx += 1
+                out[component] = mx.stack(rows, axis=0)
+
+        # Store assembled tensors in session for future tokens
+        with self._lock:
             if (
                 self._enabled
                 and self._phase == "decode"
@@ -217,21 +246,22 @@ class SessionWindowNativeCache:
                 if existing is not None:
                     self._release_layer_window(existing, session, layer_idx)
                     session.current.total_bytes -= existing.total_bytes
+                lw_tensors = {c: out[c] for c in streamed_components}
+                total_bytes = sum(t.nbytes for t in lw_tensors.values())
                 new_lw = LayerWindow(
                     expert_ids=list(selected_experts),
                     slot_by_expert={eid: slot for slot, eid in enumerate(selected_experts)},
-                    slab=slab,
-                    total_bytes=slab.total_size,
+                    tensors=lw_tensors,
+                    total_bytes=total_bytes,
                 )
                 session.current.layers[layer_idx] = new_lw
                 session.current.total_bytes += new_lw.total_bytes
                 self._current_bytes += new_lw.total_bytes
                 self._peak_bytes = max(self._peak_bytes, self._current_bytes)
-                # Upsert LUT: newest window wins for each (layer_idx, expert_idx) key
                 for slot, eid in enumerate(selected_experts):
                     session.expert_lut[(layer_idx, eid)] = (new_lw, slot)
 
-        return {c: slab.view(c) for c in streamed_components}
+        return out
 
     def stats(self) -> dict[str, object]:
         with self._lock:
@@ -255,15 +285,6 @@ class SessionWindowNativeCache:
                 "sessions": sessions,
             }
 
-    def _lookup_expert_locked(
-        self,
-        session: SessionState,
-        layer_idx: int,
-        expert_idx: int,
-    ) -> tuple[LayerWindow, int] | None:
-        # Kept for reference; load_components_for_layer now uses expert_lut directly.
-        return session.expert_lut.get((layer_idx, expert_idx))
-
     def _evict_global_locked(self) -> None:
         if self.max_bytes <= 0:
             return
@@ -285,7 +306,6 @@ class SessionWindowNativeCache:
         session = self._sessions.pop(session_id, None)
         if session is None:
             return
-        # Pass session=None: the LUT is part of the discarded object, no cleanup needed.
         while session.windows:
             self._release_window(session.windows.popleft(), None)
         if session.current is not None:
@@ -311,7 +331,6 @@ class SessionWindowNativeCache:
             for expert_idx in layer_window.expert_ids:
                 key = (layer_idx, expert_idx)
                 entry = session.expert_lut.get(key)
-                # Guard: only remove if this is still the entry's source window.
                 if entry is not None and entry[0] is layer_window:
                     del session.expert_lut[key]
-        layer_window.slab.free()
+        # mx.array refcounts drop naturally when LayerWindow is GC'd — no explicit free needed

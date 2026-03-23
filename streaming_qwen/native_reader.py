@@ -126,6 +126,19 @@ class NativeExpertReader:
         ]
         self.lib.read_component_batches_into_slots.restype = ctypes.c_int
 
+        self.lib.copy_component_batches_mmap.argtypes = [
+            ctypes.c_int32,                   # num_components
+            ctypes.POINTER(ctypes.c_void_p),  # mmap_bases
+            ctypes.POINTER(ctypes.c_uint64),  # abs_offsets
+            ctypes.POINTER(ctypes.c_uint64),  # expert_strides
+            ctypes.POINTER(ctypes.c_uint64),  # expert_sizes
+            ctypes.POINTER(ctypes.c_uint64),  # component_output_offsets
+            ctypes.POINTER(ctypes.c_int32),   # expert_indices
+            ctypes.c_int32,                   # num_experts
+            ctypes.POINTER(ctypes.c_uint8),   # out_buffer
+        ]
+        self.lib.copy_component_batches_mmap.restype = ctypes.c_int
+
         self.lib.copy_experts_multi.argtypes = [
             ctypes.c_int32,                   # num_components
             ctypes.POINTER(ctypes.c_void_p),  # src_ptrs
@@ -301,6 +314,64 @@ class NativeExpertReader:
         )
         if rc != 0:
             raise RuntimeError(f"native read_component_batches_into_slots failed: {rc}")
+
+    def copy_component_batches_mmap(
+        self,
+        specs: list[tuple[str, int, int, int, int]],
+        expert_indices: list[int],
+    ) -> dict[str, memoryview]:
+        """Copy expert batches from mmap regions via parallel memcpy.
+
+        specs: list of (name, mmap_base_ptr, abs_offset, expert_stride, expert_size)
+        Returns dict[component_name -> memoryview] into a contiguous output buffer.
+        """
+        component_count = len(specs)
+        expert_count = len(expert_indices)
+        if component_count <= 0 or expert_count <= 0:
+            return {}
+
+        names = [name for name, *_ in specs]
+        sizes = [expert_size * expert_count for _, _, _, _, expert_size in specs]
+        out_offsets = []
+        cursor = 0
+        for size in sizes:
+            out_offsets.append(cursor)
+            cursor += size
+
+        out = (ctypes.c_uint8 * cursor)()
+        mmap_bases = (ctypes.c_void_p * component_count)(
+            *[mmap_base for _, mmap_base, _, _, _ in specs]
+        )
+        abs_offsets = (ctypes.c_uint64 * component_count)(
+            *[abs_offset for _, _, abs_offset, _, _ in specs]
+        )
+        expert_strides = (ctypes.c_uint64 * component_count)(
+            *[expert_stride for _, _, _, expert_stride, _ in specs]
+        )
+        expert_sizes = (ctypes.c_uint64 * component_count)(
+            *[expert_size for _, _, _, _, expert_size in specs]
+        )
+        component_offsets = (ctypes.c_uint64 * component_count)(*out_offsets)
+        idx_arr = (ctypes.c_int32 * expert_count)(*expert_indices)
+        rc = self.lib.copy_component_batches_mmap(
+            component_count,
+            mmap_bases,
+            abs_offsets,
+            expert_strides,
+            expert_sizes,
+            component_offsets,
+            idx_arr,
+            expert_count,
+            out,
+        )
+        if rc != 0:
+            raise RuntimeError(f"copy_component_batches_mmap failed: {rc}")
+
+        blob = memoryview(out)
+        return {
+            name: blob[offset : offset + size]
+            for name, offset, size in zip(names, out_offsets, sizes)
+        }
 
     def copy_experts_multi(
         self,

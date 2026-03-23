@@ -238,44 +238,32 @@ class StreamedSwitchGLU(nn.Module):
         layer_info = self._layer_info
         streamed_components = self._streamed_components
 
-        # Session-window cache path: handles both hits (copy) and misses (SSD read)
-        # in a single call, storing results in a rolling token window.
+        # Session-window cache path: returns dict[str, mx.array] directly.
+        # On hit: zero copy, zero alloc — returns existing cached mx.arrays.
+        # On miss: reads from SSD and converts inside load_components_for_layer.
         if self.session_cache is not None:
             if streamed_components:
-                cached_mvs = self.session_cache.load_components_for_layer(
+                result = self.session_cache.load_components_for_layer(
                     layer_idx=self.layer_idx,
                     selected_experts=selected_experts,
                     layer_info=layer_info,
                     expert_store=self.expert_store,
                     streamed_components=streamed_components,
                 )
-                if cached_mvs is not None:
-                    selected_indices = mx.array(selected_experts, dtype=mx.int32)
-                    out = {}
-                    for component, info in layer_info.items():
-                        if self.expert_store.has_resident_component(self.layer_idx, component):
-                            out[component] = mx.take(
-                                self.expert_store.get_resident_component(self.layer_idx, component),
-                                selected_indices,
-                                axis=0,
-                            )
-                        else:
-                            t1 = time.perf_counter()
-                            out[component] = _blob_to_mx(
-                                cached_mvs[component], info, len(selected_experts)
-                            )
-                            STREAM_STATS["convert_seconds"] += time.perf_counter() - t1
-                    return out
+                if result is not None:
+                    return result
 
         if self.cache_limit_bytes <= 0:
             selected_indices = mx.array(selected_experts, dtype=mx.int32)
             if self.expert_store.native_reader is not None:
                 if streamed_components:
+                    t0 = time.perf_counter()
                     payload = self.expert_store.read_components_batched(
                         self.layer_idx,
                         selected_experts,
                         components=streamed_components,
                     )
+                    STREAM_STATS["load_seconds"] += time.perf_counter() - t0
                 else:
                     payload = {}
             else:

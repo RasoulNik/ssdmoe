@@ -150,7 +150,10 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
     def _load_selected(self, selected_experts: list[int]) -> dict[str, mx.array]:
         """Load selected experts, using prefetch if available."""
         layer_info = self.expert_store.expert_reads[str(self.layer_idx)]
-        streamed_components = list(layer_info.keys())
+        streamed_components = [
+            c for c in layer_info
+            if not self.expert_store.has_resident_component(self.layer_idx, c)
+        ]
 
         # Try to get from prefetch cache
         payload = None
@@ -188,8 +191,16 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
             )
 
         # Convert to MLX arrays
+        selected_mx = mx.array(selected_experts, dtype=mx.int32)
         out = {}
         for component, info in layer_info.items():
+            if self.expert_store.has_resident_component(self.layer_idx, component):
+                out[component] = mx.take(
+                    self.expert_store.get_resident_component(self.layer_idx, component),
+                    selected_mx,
+                    axis=0,
+                )
+                continue
             t1 = time.perf_counter()
             if self.expert_store.native_reader is not None:
                 out[component] = _blob_to_mx(payload[component], info, len(selected_experts))
@@ -201,13 +212,15 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         STREAM_STATS["calls"] += 1
-        selected = sorted(set(int(v) for v in np.array(indices.tolist()).flatten()))
+        t0 = time.perf_counter()
+        indices_np = np.array(indices.tolist(), dtype=np.int32)
+        selected_np = np.unique(indices_np)
+        selected = selected_np.tolist()
         STREAM_STATS["selected_experts_total"] += len(selected)
         if not selected:
             return mx.zeros((*x.shape[:-1], 0, x.shape[-1]), dtype=x.dtype)
 
-        t0 = time.perf_counter()
-        local_indices = _remap_indices(indices, selected)
+        local_indices = _remap_indices(indices_np, selected_np)
         STREAM_STATS["remap_seconds"] += time.perf_counter() - t0
         tensors = self._load_selected(selected)
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ctypes
 import json
+import mmap
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +34,8 @@ class ExpertStore:
         self.model_path = Path(self.index["model_path"]).expanduser().resolve()
         self.expert_reads = self.index["expert_reads"]
         self._fds: dict[str, int] = {}
+        self._mmaps: dict[str, mmap.mmap] = {}
+        self._mmap_bases: dict[str, int] = {}  # file_name -> base address of mmap region
         self.use_nocache = use_nocache
         self.native_reader = (
             NativeExpertReader(native_reader_path) if native_reader_path else None
@@ -63,8 +67,22 @@ class ExpertStore:
                 if self.use_nocache:
                     fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
                 self._fds[file_name] = fd
+                # ACCESS_COPY = MAP_PRIVATE: writable mapping, but pages are only
+                # copied on actual write (which we never do).  Reads serve from
+                # the same OS page cache as pread, and from_buffer works because
+                # the mapping is technically writable.
+                mm = mmap.mmap(fd, 0, access=mmap.ACCESS_COPY)
+                self._mmaps[file_name] = mm
+                # Compute base pointer once; valid for the lifetime of mm.
+                self._mmap_bases[file_name] = ctypes.addressof(
+                    (ctypes.c_char * 1).from_buffer(mm)
+                )
 
     def close(self) -> None:
+        self._mmap_bases.clear()
+        for mm in self._mmaps.values():
+            mm.close()
+        self._mmaps.clear()
         for fd in self._fds.values():
             os.close(fd)
         self._fds.clear()
@@ -140,6 +158,85 @@ class ExpertStore:
             total_bytes += info["expert_size"] * len(expert_indices)
 
         out = self.native_reader.read_component_batches(specs, expert_indices)
+        self.stats["component_reads"] += len(selected_components) * len(expert_indices)
+        self.stats["bytes_read"] += total_bytes
+        self.stats["expert_reads"] += len(expert_indices)
+        self.stats["read_seconds"] += time.perf_counter() - t0
+        return out
+
+    def read_components_mmap_native(
+        self,
+        layer_idx: int,
+        expert_indices: list[int],
+        components: list[str] | None = None,
+    ) -> dict[str, memoryview]:
+        """Read experts via parallel memcpy from mmap regions (no pread syscalls).
+
+        For data in the OS page cache this avoids all kernel-mode transitions —
+        dispatch_apply threads copy directly from mapped pages.  Cold pages still
+        trigger a page fault but no system-call overhead on top.
+        """
+        if self.native_reader is None:
+            raise RuntimeError("native reader not configured")
+        layer_info = self.expert_reads[str(layer_idx)]
+        selected_components = components or list(layer_info.keys())
+        t0 = time.perf_counter()
+
+        specs = [
+            (
+                component,
+                self._mmap_bases[layer_info[component]["file"]],
+                layer_info[component]["abs_offset"],
+                layer_info[component]["expert_stride"],
+                layer_info[component]["expert_size"],
+            )
+            for component in selected_components
+        ]
+        total_bytes = sum(
+            layer_info[c]["expert_size"] * len(expert_indices)
+            for c in selected_components
+        )
+        out = self.native_reader.copy_component_batches_mmap(specs, expert_indices)
+        self.stats["component_reads"] += len(selected_components) * len(expert_indices)
+        self.stats["bytes_read"] += total_bytes
+        self.stats["expert_reads"] += len(expert_indices)
+        self.stats["read_seconds"] += time.perf_counter() - t0
+        return out
+
+    def read_components_mmap(
+        self,
+        layer_idx: int,
+        expert_indices: list[int],
+        components: list[str] | None = None,
+    ) -> dict[str, bytes]:
+        """Read experts via mmap — no dispatch_apply, no kernel copy.
+
+        For data already in the OS page cache this is a pure RAM copy at
+        memory-bandwidth speed.  For cold pages it triggers a page fault and
+        the OS reads from SSD, similar to pread but without the GCD overhead.
+        """
+        layer_info = self.expert_reads[str(layer_idx)]
+        selected_components = components or list(layer_info.keys())
+        t0 = time.perf_counter()
+        out: dict[str, bytes] = {}
+        total_bytes = 0
+        for component in selected_components:
+            info = layer_info[component]
+            mm = self._mmaps[info["file"]]
+            size = info["expert_size"]
+            base = info["abs_offset"]
+            stride = info["expert_stride"]
+            if len(expert_indices) == 1:
+                # Single expert: return a direct memoryview slice — zero extra copy
+                offset = base + expert_indices[0] * stride
+                out[component] = mm[offset : offset + size]
+            else:
+                # Multiple experts: join slices into one contiguous buffer
+                out[component] = b"".join(
+                    mm[base + eidx * stride : base + eidx * stride + size]
+                    for eidx in expert_indices
+                )
+            total_bytes += size * len(expert_indices)
         self.stats["component_reads"] += len(selected_components) * len(expert_indices)
         self.stats["bytes_read"] += total_bytes
         self.stats["expert_reads"] += len(expert_indices)

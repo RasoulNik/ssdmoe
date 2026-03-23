@@ -23,6 +23,21 @@ int read_component_batches(
     int32_t num_experts,
     uint8_t *out_buffer);
 
+/* mmap variant: copies expert data from pre-mapped memory using memcpy instead
+   of pread.  mmap_bases[c] is the base pointer of the mmap region for shard
+   file c; abs_offsets/strides/sizes have identical semantics to the pread
+   variant.  Falls back to a sequential loop for total_tasks <= 8. */
+int copy_component_batches_mmap(
+    int32_t num_components,
+    const void *const *mmap_bases,
+    const uint64_t *abs_offsets,
+    const uint64_t *expert_strides,
+    const uint64_t *expert_sizes,
+    const uint64_t *component_output_offsets,
+    const int32_t *expert_indices,
+    int32_t num_experts,
+    uint8_t *out_buffer);
+
 int read_component_batches_into_slots(
     int32_t num_components,
     const int *fds,

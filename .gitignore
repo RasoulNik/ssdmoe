@@ -4,3 +4,5 @@
 .open-webui-venv/
 .webui_secret_key
 __pycache__/
+native/*.dylib
+prompts/

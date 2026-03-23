@@ -16,6 +16,8 @@ import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models.cache import make_prompt_cache
 
+from streaming_qwen.prefetch_switch import PrefetchManager
+from streaming_qwen.streamed_switch import STREAM_STATS, reset_stream_stats, set_stream_profiling
 from streaming_qwen.runtime import (
     begin_session_cache_request,
     build_streamed_model,
@@ -87,6 +89,21 @@ def parse_args() -> argparse.Namespace:
         help="Explicit session id to use for session-scoped cache benchmarks",
     )
     parser.add_argument(
+        "--use-prefetch",
+        action="store_true",
+        default=False,
+        help="Enable speculative expert prefetch (PrefetchingStreamedSwitchGLU)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable per-op GPU timing (PROFILE_STREAMED=True). "
+            "Forces mx.eval after each MoE sub-op — tok/s will be lower than production."
+        ),
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="Optional JSON output path",
@@ -136,6 +153,7 @@ def main() -> None:
         expert_cache_strategy=args.expert_cache_strategy,
         expert_window_tokens=args.expert_window_tokens,
         expert_cache_bytes=int(digits * cache_sizes[suffix]),
+        use_prefetch=args.use_prefetch,
     )
     try:
         prompt_tokens = prompt_tokens_from_messages(
@@ -162,6 +180,8 @@ def main() -> None:
         )
 
         expert_store.reset_stats()
+        reset_stream_stats()
+        set_stream_profiling(args.profile)
         mx.reset_peak_memory()
         set_routed_top_k(model, args.routed_top_k)
         set_session_cache_phase(model, "decode")
@@ -212,6 +232,77 @@ def main() -> None:
                 **session_cache_stats,
                 "current_gib": round(session_cache_stats["current_bytes"] / 1024**3, 3),
                 "peak_gib": round(session_cache_stats["peak_bytes"] / 1024**3, 3),
+            }
+        set_stream_profiling(False)  # stop profiling after decode
+
+        n_tok = len(generated_tokens)
+        n_calls = STREAM_STATS["calls"]  # = n_tok * n_moe_layers
+        elapsed = (token_times[-1] - started) if token_times else 0.0
+
+        # Build per-token timing breakdown.
+        # remap_seconds = GPU→CPU pipeline sync + numpy work (the unavoidable barrier).
+        # load_seconds  = synchronous SSD pread time.
+        # convert_seconds = bytes→numpy→mx.array conversion.
+        # qmm_*/swiglu  = MoE GPU compute (only non-zero when --profile forces mx.eval).
+        # non_moe       = everything else: attention, norms, embed, lm_head, Python overhead.
+        moe_stat_keys = [
+            ("GPU sync + remap", "remap_seconds"),
+            ("SSD reads",        "load_seconds"),
+            ("bytes→mx.array",   "convert_seconds"),
+            ("qmm_up  (GPU)",    "qmm_up_seconds"),
+            ("qmm_gate (GPU)",   "qmm_gate_seconds"),
+            ("swiglu  (GPU)",    "swiglu_seconds"),
+            ("qmm_down (GPU)",   "qmm_down_seconds"),
+        ]
+        moe_total = sum(STREAM_STATS[k] for _, k in moe_stat_keys)
+        non_moe = max(0.0, elapsed - moe_total)
+        profile_rows = [
+            {
+                "component": label,
+                "total_s": round(STREAM_STATS[key], 4),
+                "per_token_ms": round(STREAM_STATS[key] / n_tok * 1000, 2) if n_tok else 0.0,
+                "pct": round(STREAM_STATS[key] / elapsed * 100, 1) if elapsed else 0.0,
+            }
+            for label, key in moe_stat_keys
+        ]
+        profile_rows.append({
+            "component": "non-MoE (inferred)",
+            "total_s": round(non_moe, 4),
+            "per_token_ms": round(non_moe / n_tok * 1000, 2) if n_tok else 0.0,
+            "pct": round(non_moe / elapsed * 100, 1) if elapsed else 0.0,
+        })
+        result["timing_profile"] = {
+            "n_tokens": n_tok,
+            "n_moe_calls": n_calls,
+            "profiled_gpu_ops": args.profile,
+            "rows": profile_rows,
+        }
+        # Pretty-print to stderr so it's visible even without --output
+        import sys
+        print("\n=== Timing profile (caching disabled) ===", file=sys.stderr)
+        print(f"  {'Component':<22} {'Total':>8}  {'ms/tok':>8}  {'%':>6}", file=sys.stderr)
+        print(f"  {'-'*22}  {'-'*8}  {'-'*8}  {'-'*6}", file=sys.stderr)
+        for row in profile_rows:
+            print(
+                f"  {row['component']:<22} {row['total_s']:>8.3f}s"
+                f"  {row['per_token_ms']:>7.1f}ms  {row['pct']:>5.1f}%",
+                file=sys.stderr,
+            )
+        print(f"  {'TOTAL':<22} {elapsed:>8.3f}s  {elapsed/n_tok*1000:>7.1f}ms  {'100.0':>5}%",
+              file=sys.stderr)
+        if args.profile:
+            print(
+                "  NOTE: --profile forces mx.eval after each GPU op → tok/s is lower than production.",
+                file=sys.stderr,
+            )
+
+        prefetch_mgr: PrefetchManager | None = getattr(expert_store, "prefetch_manager", None)
+        if prefetch_mgr is not None:
+            ps = prefetch_mgr.stats
+            total_pf = ps["prefetch_hits"] + ps["prefetch_misses"]
+            result["prefetch"] = {
+                **ps,
+                "hit_rate": round(ps["prefetch_hits"] / total_pf, 3) if total_pf else 0.0,
             }
         if expert_store.stats["read_seconds"] > 0:
             result["expert_read_gbps"] = round(
