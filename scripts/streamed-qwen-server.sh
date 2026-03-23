@@ -125,7 +125,6 @@ start_server() {
 
   screen -dmS "$SESSION_NAME" /bin/zsh -lc "
     cd '$ROOT_DIR' && \
-    export PYTHONPATH='.' && \
     exec poetry run python scripts/streamed_qwen_server.py \
       --model '$MODEL_PATH' \
       --index '$INDEX_PATH' \
