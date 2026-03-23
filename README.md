@@ -123,8 +123,8 @@ and only prefills the new user message and tool results.
 
 ```bash
 # 1. Clone and install
-git clone <repo-url>
-cd streaming-qwen-server
+git clone https://github.com/RasoulNik/ssdmoe.git
+cd ssdmoe
 poetry install
 
 # 2. Build the native C expert reader
@@ -168,6 +168,60 @@ Example — enable persistent KV cache:
 ```bash
 KV_CACHE_DIR=.run/kv-cache ./scripts/streamed-qwen-server.sh start
 ```
+
+## Using with opencode
+
+[opencode](https://opencode.ai) is an AI coding agent that runs in the terminal.
+The repo includes a ready-made config and launcher that points opencode at the local server.
+
+**1. Start the server** (with persistent KV cache so long coding sessions stay fast):
+
+```bash
+KV_CACHE_DIR=.run/kv-cache ./scripts/streamed-qwen-server.sh start
+```
+
+**2. Launch opencode** using the bundled config:
+
+```bash
+# Interactive chat session
+./scripts/opencode-streamed-simple.sh
+
+# Non-interactive: run a single prompt and exit (useful for scripts)
+./scripts/opencode-streamed-simple.sh run "Explain the expert routing in src/streaming_qwen/streamed_switch.py"
+```
+
+The launcher copies `configs/opencode-streamed-simple.json` into a working directory
+and starts opencode from there so it picks up the provider config automatically.
+
+**Agents defined in the config:**
+
+| Agent | Tools | Use case |
+|-------|-------|----------|
+| `simple` (default) | none | Chat, Q&A, writing |
+| `code` | `bash`, `read`, `glob`, `grep` | Code exploration and analysis |
+
+Switch agents with `OPENCODE_AGENT=code ./scripts/opencode-streamed-simple.sh`.
+
+**Manual opencode setup** — if you already have opencode configured elsewhere, add
+this provider block to your `opencode.json`:
+
+```json
+"provider": {
+  "streamed": {
+    "npm": "@ai-sdk/openai-compatible",
+    "name": "MLX Streamed (local)",
+    "options": {
+      "baseURL": "http://127.0.0.1:9002/v1",
+      "apiKey": "dummy"
+    },
+    "models": {
+      "streamed-qwen-k4": { "name": "Streamed Qwen K4" }
+    }
+  }
+}
+```
+
+Then select the model with `--model streamed/streamed-qwen-k4`.
 
 ## K — Number of Active Experts
 
