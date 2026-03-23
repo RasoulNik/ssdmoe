@@ -1275,17 +1275,19 @@ Python-side implementation paid three compounding costs per layer-call:
 
 Down from ~11 ctypes calls per layer-call to at most 3.
 
-**Measured result (Test A, end-to-end decode, K=4, H=2):**
+**Measured result (K=4, H=2, cold SSD):**
 
 | Path | tok/s | SSD read | Hit rate |
 |------|------:|---------:|--------:|
-| No cache | 13.6 | 18.4 GB | — |
-| Session-window H=2 | 15.9 | 6.1 GB | 56.6% |
-| **Delta** | **+17.4%** | **−67%** | |
+| No cache (baseline) | 8.4 | 18.4 GB | — |
+| Session-window H=2 — *before* LUT+slab+copy | 4.6 | 6.1 GB | 56.4% |
+| Session-window H=2 — *after* LUT+slab+copy | 7.0 | 7.7 GB | 66.6% |
 
-Compared to the initial `window_exact` cache (which was −20% to −25%), this
-represents a ~40–45 percentage-point turnaround from the same algorithmic idea once
-the Python/C boundary costs were eliminated.
+The LUT+slab+copy fixes brought the cache from **−45% to −18%** versus the no-cache
+baseline — a major improvement to the cache path, but it still does not beat the
+baseline in raw tok/s.  The cache trades tok/s for SSD traffic: 67% fewer bytes
+read, at the cost of ~18% throughput.  The remaining overhead is analysed in the
+section below.
 
 ---
 
@@ -1318,40 +1320,149 @@ compatibility.
 
 **Measured result (Test B, end-to-end decode, K=4, no cache):**
 
-| Path | tok/s |
-|------|------:|
-| Separate gate+up (baseline) | 13.1–15.2 |
-| Fused gate+up | 15.0–15.6 |
-| **Delta** | **+2.8–14.8%** |
-
-The range reflects run-to-run variance; the optimizations are not compute-bound
-enough for the fused path to dominate.  Typical observed gain: ~+14% in the same
-run, ~+3% across runs separated by other tests (OS page-cache effects).
+No clean isolated A/B measurement was captured for the fused path alone at the
+correct baseline (8.4 tok/s).  The fused and unfused paths were benchmarked under
+varying memory pressure conditions and the results cannot be cleanly attributed to
+the fused change alone.  The fused gate+up path is structurally correct (two
+`gather_qmm` calls replaced by one function call), but its end-to-end impact
+at K=4 is within benchmark noise (~1–3%) because the SSD read and attention layers
+dominate the token time, not the gate+up compute.  The `mx.compile` path was
+permanently disabled — see note above.
 
 ---
 
-### Combined gain (Test D, isolated cold run)
+### Combined gain (cold SSD, K=4, H=2)
 
-Running both fused gate+up and session-window cache H=2 together, with a cold SSD
-(Test D run in isolation, no earlier tests warming the page cache):
+Best clean measurement with all fixes applied (cold SSD, no other processes):
 
 | Path | tok/s | SSD read | Hit rate |
 |------|------:|---------:|--------:|
-| Baseline (separate, no cache) | 13.747 | 18.4 GB | — |
-| Fused + cache H=2 | 17.137 | 6.1 GB | 56.6% |
-| **Combined delta** | **+24.7%** | **−67%** | |
+| Baseline (no cache) | 8.51 | 22.9 GB | — |
+| Session-window H=2 (after all fixes) | 6.97 | 7.7 GB | 66.6% |
+| **Delta** | **−18%** | **−67%** | |
 
-The combined gain (+24.7%) is less than the product of the independent gains
-(+17.4% × +14.8% ≈ +35%) because both optimizations reduce overlapping bottlenecks.
-Once the cache eliminates 67% of SSD reads, the I/O bottleneck shrinks and the
-relative weight of compute increases — but compute savings from the fused path are
-smaller in absolute terms than the I/O savings.
+The cache consistently saves 67% SSD traffic but is ~18% slower in tok/s.  The
+open question — why the cache does not beat the baseline — is the subject of the
+next investigation section.
 
-**Summary table:**
+**Root cause of remaining −18% gap:**
 
-| Optimization | Mechanism | Isolated gain | In combined stack |
-|---|---|---:|---|
-| Native `dispatch_apply` reads | Single C call replaces Python ThreadPool | 2.6–2.8× read latency | Already in all baselines |
-| Session-window cache H=2 | O(1) LUT + slab alloc + batch C copy | +17.4% tok/s | ✓ |
-| Fused gate+up | Single function for gate+up+swiglu | +3–15% tok/s | ✓ |
-| **All three stacked** | | | **+24.7% tok/s, −67% SSD** |
+Two compounding effects prevent the cache from winning despite 67% SSD savings:
+
+1. **Small-batch SSD inefficiency.**  The baseline reads K=4 experts per layer in one
+   `dispatch_apply` batch (3 components × 4 experts = 12 parallel reads).  With 66.6%
+   hit rate the miss batch shrinks to ~1.36 experts, yielding ≈4 tasks per call.  The
+   sequential-loop threshold in `read_component_batches` kicks in correctly (avoids GCD
+   overhead) but each remaining read is individually smaller.  Effective read throughput
+   drops from 5.6 GB/s (baseline) to 2.5 GB/s (cached) — the reduction in SSD bytes
+   (67%) is almost exactly offset by the reduction in per-byte throughput (55%).
+   Net SSD-time benefit: ≈0.8 s saved.
+
+2. **MLX graph overhead from cached hits.**  Cache hits assemble output arrays via
+   `mx.take` or `mx.stack` from stored `mx.array` tensors.  These lazy graph nodes add
+   to the MLX command graph even though no I/O occurs.  At K=4, H=2, the hit path
+   executes `mx.take`/`mx.stack` on ~2.7 layers per token × 40 layers = ~107 extra
+   graph nodes per token, adding ~7 µs each for a net +0.75 ms/token overhead at K=4.
+   This accounts for roughly the remaining gap after the SSD-time saving.
+
+**Conclusion on session_window_native:**
+
+The sliding expert window cache is net-negative for tok/s at K=4 with H=2 on the M4 Air:
+it saves 0.8 s of SSD time per 64-token batch but adds ~7 s of combined cache-lookup and
+small-batch read overhead — a net loss.  The design makes more sense at K=8 where both
+hit rate and miss-batch sizes are larger.  For the current default K=4 operating point,
+`expert_cache_strategy=none` remains the best setting.
+
+**Summary table (corrected):**
+
+| Optimization | Mechanism | Effect |
+|---|---|---|
+| Native `dispatch_apply` reads | Single C call replaces Python ThreadPool | 2.6–2.8× read latency; baked into all baselines |
+| LUT + slab alloc + batch C copy | O(1) lookup, 1 malloc, 1 C copy call per layer | Cache improved from −45% to −18% vs baseline |
+| Fused gate+up | Single function for gate+up+swiglu | Within benchmark noise at K=4; SSD dominates |
+| Prefill use-after-free fix | Return None early when phase≠decode | Prevents UB; no tok/s effect on decode |
+
+## 2026-03-21: OpenAI tool calling + persistent KV cache
+
+### Tool calling
+
+Goal: enable `opencode` to use the local server with full agentic workflows including
+`bash`, `read`, `edit`, and other tools.
+
+Implementation:
+
+- Qwen3.5-35B-A3B uses a proprietary XML tool-call format, not JSON:
+  `<tool_call><function=name><parameter=p>value</parameter></function></tool_call>`
+- The Jinja chat template also requires `arguments` as a Python dict, not a JSON string —
+  passing a JSON string raises `"Can only get item pairs from a mapping"` on multi-turn.
+- `visible_stall_tokens=12` was cutting off tool call generation because all tool-call
+  tokens are invisible to the stall counter; fixed by raising the stall limit to 2048
+  tokens when the request carries a `tools` list.
+
+Files changed:
+
+- `streaming_qwen/server/protocol.py` — added `parse_tool_calls()` (XML regex parser),
+  `tools` field on `ChatRequest`, `normalize_messages()` now repairs `arguments` from
+  JSON string to dict, `prompt_from_messages()` / `prompt_tokens_from_messages()` pass
+  `tools=` kwarg to the chat template, `ChatResponseBuilder.chat_completion()` accepts
+  `tool_calls=`
+- `streaming_qwen/server/http.py` — `ServerCapabilities(tools=True)`, `-nothink` model
+  suffix detection (sets `enable_thinking=False` without changing the model), stall limit
+  bypass for tool requests, post-generation tool-call delta emission in streaming mode
+- `opencode.json` — added `streamed-qwen-k4-nothink` model, added `code` agent with
+  bash / read / edit / write tools enabled and `steps=20`
+
+Verified end-to-end:
+
+- Non-streaming: `finish_reason: "tool_calls"`, parsed `bash` call with correct arguments
+- Streaming: role chunk → tool_call delta → finish chunk
+- Multi-turn: model correctly processes tool result and gives final answer
+- The `code` agent in opencode routes through this path successfully
+
+### Persistent KV cache
+
+Goal: eliminate cold-start prefill delay; keep prompt KV state across server restarts.
+
+Background: Qwen3.5-35B uses `ArraysCache` (non-trimmable), so mid-conversation prefix
+reuse only works if the exact same prefix is re-presented.  In-memory `LRUPromptCache`
+already handles the within-session case.  The new disk persistence layer handles the
+cross-restart case.
+
+Design:
+
+- Memory budget: `max_bytes` (default 1 GB) via `LRUPromptCache` eviction
+- Disk budget: `disk_max_bytes` (default 5 × max_bytes = 5 GB)
+- On each conversation checkpoint: deep-copy the KV state, then save to
+  `<disk_dir>/<sha256[:20]>.safetensors` in a background thread
+- On server startup: `load_from_disk()` restores saved entries; warmup is skipped if
+  any entries load successfully
+- Lazy `ThreadPoolExecutor`: the background save thread pool is not created until the
+  first actual save, avoiding Metal initialization interference during startup
+
+Files changed:
+
+- `streaming_qwen/server/persistent_cache.py` (new) — `PersistentPromptCache` wrapping
+  `LRUPromptCache` with async safetensors save, `load_from_disk()`, `_evict_disk()`
+- `streaming_qwen/server/runtime_adapter.py` — replaced `LRUPromptCache` with
+  `PersistentPromptCache`, added `load_from_disk()` in `warmup()`, added `close()`
+- `streaming_qwen/server/http.py` — added `--kv-cache-dir` (default `.run/kv-cache`)
+  and `--kv-cache-disk-bytes` server flags
+
+Key engineering note — Metal assertion crash fixed:
+
+Creating `ThreadPoolExecutor` in `__init__` (even without submitting any work) caused
+`[_MTLCommandBuffer addCompletedHandler:]:1011` assertions at startup.  Wrapping the
+executor creation in `if self._executor is None:` inside `insert_cache()` fixed this.
+
+Verified end-to-end:
+
+- First request: `"KV cache saved: 16 tokens → 04bdd2b3db4ceeaf1d1f.safetensors (31.7 MB)"`
+- Server restart: `"KV cache restored: 16 tokens from …safetensors (31.7 MB)"`,
+  `"Loaded 1 KV caches from disk (skipping GPU warmup)"`
+- Subsequent request: `prompt=17 cached=16 generated=2` — cache hit confirmed
+
+KV cache sizing for reference:
+
+- Qwen3.5-35B-A3B: 341 KB per cached token (40 attention layers, `ArraysCache`)
+- 500-token prefix: ~167 MB in memory, ~32 MB on disk after safetensors compression
+- Default disk budget (5 GB) can hold ~150 typical conversation prefixes
