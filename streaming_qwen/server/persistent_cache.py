@@ -97,11 +97,14 @@ class PersistentPromptCache:
         """
         if not self._disk_dir:
             return 0
-        # Newest files first so the LRU ends up prioritising recent entries.
+        # Oldest files first: LRUPromptCache.insert_cache appends to the RIGHT
+        # of the checkpoint deque and evicts from the LEFT (popleft).  Inserting
+        # oldest entries first means the NEWEST entries are pushed last (rightmost)
+        # and are the last to be evicted when the memory budget is exceeded.
         files = sorted(
             self._disk_dir.glob("*.safetensors"),
             key=lambda p: p.stat().st_mtime,
-            reverse=True,
+            reverse=False,
         )
         loaded = 0
         for cache_path in files:

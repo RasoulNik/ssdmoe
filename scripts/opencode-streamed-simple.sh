@@ -12,8 +12,9 @@ cd "$TMP_DIR"
 
 if [[ "${1:-}" == "run" ]]; then
   shift
+  AGENT="${OPENCODE_AGENT:-simple}"
   exec opencode run \
-    --agent simple \
+    --agent "$AGENT" \
     --model streamed/streamed-qwen-k4 \
     --title x \
     "$@"

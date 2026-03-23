@@ -500,6 +500,7 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                 prompt_checkpoint_saved = True
 
             mx.reset_peak_memory()
+            last_response = None
             try:
                 session.set_top_k(session.decode_top_k)
                 for response in stream_generate(
@@ -513,16 +514,24 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                     prompt_progress_callback=save_prompt_checkpoint,
                 ):
                     cache_key.append(int(response.token))
+                    last_response = response
                     yield response
             finally:
                 session.set_top_k(session.decode_top_k)
-                session.prompt_cache.insert_cache(session.cache_namespace, cache_key, cache)
-                # Store a history-compatible checkpoint so multi-turn conversations get a
-                # cache hit at the full conversation prefix, not just at the system prompt.
-                # Qwen3's template injects <think>\n\n</think>\n\n into the generation prompt
-                # when enable_thinking=False, which ends up in cache_key but NOT in future
-                # turns' history encoding — breaking prefix matching.  Re-prefill without
-                # those tokens and store at the history-compatible key.
+                if last_response is not None:
+                    logging.info(
+                        "generation stats: prompt=%d cached=%d prefill=%.1f tok/s decode=%d tokens @ %.1f tok/s",
+                        len(prompt_tokens),
+                        cached_tokens,
+                        getattr(last_response, "prompt_tps", 0),
+                        getattr(last_response, "generation_tokens", 0),
+                        getattr(last_response, "generation_tps", 0),
+                    )
+                # Store history-compatible checkpoint BEFORE insert_cache(cache_key, cache).
+                # insert_cache with checkpoint=False can evict the oldest checkpoint (e.g.
+                # system+tools) from memory.  _save_end_of_turn_checkpoint needs that checkpoint
+                # as a base for re-prefill — if it's already evicted we re-prefill from scratch
+                # (7530 tokens, 150s) instead of from the existing base (~2000 tokens, ~40s).
                 self._save_end_of_turn_checkpoint(
                     session=session,
                     request=request,
@@ -531,6 +540,8 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                     enable_thinking=enable_thinking,
                     prefill_step_size=self._args().prefill_step_size,
                 )
+                # Store the full generation cache (may evict oldest checkpoint).
+                session.prompt_cache.insert_cache(session.cache_namespace, cache_key, cache)
                 # Flush queued checkpoint saves NOW — inference is done, Metal is idle.
                 # save_prompt_cache issues Metal GPU→CPU blits; running it here (on the
                 # handler thread, after stream_generate) avoids concurrent Metal access.

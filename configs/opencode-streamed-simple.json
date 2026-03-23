@@ -40,6 +40,28 @@
         "plan_enter": false,
         "plan_exit": false
       }
+    },
+    "code": {
+      "mode": "primary",
+      "description": "Code agent with bash/read/glob/grep for multi-turn tool use experiments.",
+      "tools": {
+        "bash": true,
+        "read": true,
+        "glob": true,
+        "grep": true,
+        "edit": false,
+        "write": false,
+        "patch": false,
+        "task": false,
+        "webfetch": false,
+        "websearch": false,
+        "todoread": false,
+        "todowrite": false,
+        "skill": false,
+        "question": false,
+        "plan_enter": false,
+        "plan_exit": false
+      }
     }
   }
 }
