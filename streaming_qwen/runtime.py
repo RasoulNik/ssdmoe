@@ -14,6 +14,7 @@ from .model_io import (
 )
 from .pipelined_moe import patch_pipelined_moe
 from .prefetch_switch import PrefetchManager, PrefetchingStreamedSwitchGLU
+from .session_window_cache import SessionWindowNativeCache
 from .streamed_switch import StreamedSwitchGLU
 
 
@@ -38,6 +39,7 @@ def _patch_streamed_switches(
     use_prefetch: bool = False,
     fused_gate_up: bool = False,
     compile_fused_gate_up: bool = False,
+    session_cache: SessionWindowNativeCache | None = None,
 ) -> None:
     layers = list(iter_moe_layers(model))
     prefetch_manager = (
@@ -68,6 +70,7 @@ def _patch_streamed_switches(
                 cache_limit_bytes=cache_limit_bytes,
                 fused_gate_up=fused_gate_up,
                 compile_fused_gate_up=compile_fused_gate_up,
+                session_cache=session_cache,
             )
     expert_store.prefetch_manager = prefetch_manager
 
@@ -104,6 +107,9 @@ def build_streamed_model(
     moe_impl: str = "streamed",
     fused_gate_up: bool = False,
     compile_fused_gate_up: bool = False,
+    expert_cache_strategy: str = "none",
+    expert_window_tokens: int = 0,
+    expert_cache_bytes: int = 0,
 ):
     model_path = Path(model_path).expanduser().resolve()
     index_path = Path(index_path).expanduser().resolve()
@@ -126,6 +132,14 @@ def build_streamed_model(
 
     available_weight_names = set(list_non_expert_text_tensors(model_path))
     quantization = config.get("quantization") or config.get("quantization_config") or {}
+
+    session_cache: SessionWindowNativeCache | None = None
+    if expert_cache_strategy == "session_window_native" and expert_window_tokens > 0:
+        session_cache = SessionWindowNativeCache(
+            max_bytes=expert_cache_bytes,
+            window_tokens=expert_window_tokens,
+        )
+
     if moe_impl != "pipelined":
         _patch_streamed_switches(
             model,
@@ -135,6 +149,7 @@ def build_streamed_model(
             use_prefetch=use_prefetch,
             fused_gate_up=fused_gate_up,
             compile_fused_gate_up=compile_fused_gate_up,
+            session_cache=session_cache,
         )
     _quantize_resident_modules(model, config, available_weight_names)
 
@@ -159,3 +174,87 @@ def build_streamed_model(
 
     tokenizer = load_tokenizer(model_path)
     return model, tokenizer, expert_store, config
+
+
+# ---------------------------------------------------------------------------
+# Session-window cache helpers (called per-request by server / bench scripts)
+# ---------------------------------------------------------------------------
+
+def _get_session_cache(model) -> SessionWindowNativeCache | None:
+    """Return the shared SessionWindowNativeCache from the first MoE layer, or None."""
+    for layer in iter_moe_layers(model):
+        switch = getattr(layer.mlp, "switch_mlp", None)
+        if switch is not None:
+            return getattr(switch, "session_cache", None)
+    return None
+
+
+def begin_session_cache_request(
+    model,
+    *,
+    session_id: str | None,
+    phase: str,
+    enabled: bool,
+    ephemeral: bool,
+) -> None:
+    cache = _get_session_cache(model)
+    if cache is not None:
+        cache.begin_request(
+            session_id=session_id,
+            phase=phase,
+            enabled=enabled,
+            ephemeral=ephemeral,
+        )
+
+
+def end_session_cache_request(model) -> None:
+    cache = _get_session_cache(model)
+    if cache is not None:
+        cache.end_request()
+
+
+def set_session_cache_phase(model, phase: str) -> None:
+    cache = _get_session_cache(model)
+    if cache is not None:
+        cache.set_phase(phase)
+
+
+def complete_session_cache_token(model) -> None:
+    cache = _get_session_cache(model)
+    if cache is not None:
+        cache.complete_token()
+
+
+def collect_session_cache_stats(model) -> dict | None:
+    cache = _get_session_cache(model)
+    if cache is None:
+        return None
+    return cache.stats()
+
+
+def collect_window_cache_stats(model) -> dict:
+    """Aggregate stats from the in-process LRU tensor cache (cache_limit_bytes path)."""
+    entries = 0
+    bytes_used = 0
+    for layer in iter_moe_layers(model):
+        switch = getattr(layer.mlp, "switch_mlp", None)
+        if switch is not None:
+            entries += len(getattr(switch, "_cache", {}))
+            bytes_used += getattr(switch, "_cache_bytes", 0)
+    return {
+        "current_entries": entries,
+        "current_bytes": bytes_used,
+        "peak_entries": 0,
+        "peak_bytes": 0,
+    }
+
+
+def set_window_cache_enabled(model, enabled: bool, *, reset: bool = False) -> None:
+    """Enable or disable the in-process LRU tensor cache on all MoE layers."""
+    for layer in iter_moe_layers(model):
+        switch = getattr(layer.mlp, "switch_mlp", None)
+        if switch is None:
+            continue
+        if reset and hasattr(switch, "_cache"):
+            switch._cache.clear()
+            switch._cache_bytes = 0

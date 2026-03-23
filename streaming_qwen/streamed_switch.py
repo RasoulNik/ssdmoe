@@ -172,6 +172,7 @@ class StreamedSwitchGLU(nn.Module):
         cache_limit_bytes: int = 0,
         fused_gate_up: bool = False,
         compile_fused_gate_up: bool = False,
+        session_cache=None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -182,6 +183,7 @@ class StreamedSwitchGLU(nn.Module):
         self.cache_limit_bytes = cache_limit_bytes
         self.fused_gate_up = fused_gate_up
         self.compile_fused_gate_up = compile_fused_gate_up
+        self.session_cache = session_cache  # SessionWindowNativeCache | None
         self._cache: OrderedDict[tuple[int, int], tuple[dict[str, mx.array], int]] = OrderedDict()
         self._cache_bytes = 0
 
@@ -229,6 +231,40 @@ class StreamedSwitchGLU(nn.Module):
 
     def _load_selected(self, selected_experts: list[int]) -> dict[str, mx.array]:
         layer_info = self.expert_store.expert_reads[str(self.layer_idx)]
+
+        # Session-window cache path: handles both hits (copy) and misses (SSD read)
+        # in a single call, storing results in a rolling token window.
+        if self.session_cache is not None:
+            streamed_components = [
+                c for c in layer_info
+                if not self.expert_store.has_resident_component(self.layer_idx, c)
+            ]
+            if streamed_components:
+                cached_mvs = self.session_cache.load_components_for_layer(
+                    layer_idx=self.layer_idx,
+                    selected_experts=selected_experts,
+                    layer_info=layer_info,
+                    expert_store=self.expert_store,
+                    streamed_components=streamed_components,
+                )
+                if cached_mvs is not None:
+                    selected_indices = mx.array(selected_experts, dtype=mx.int32)
+                    out = {}
+                    for component, info in layer_info.items():
+                        if self.expert_store.has_resident_component(self.layer_idx, component):
+                            out[component] = mx.take(
+                                self.expert_store.get_resident_component(self.layer_idx, component),
+                                selected_indices,
+                                axis=0,
+                            )
+                        else:
+                            t1 = time.perf_counter()
+                            out[component] = _blob_to_mx(
+                                cached_mvs[component], info, len(selected_experts)
+                            )
+                            STREAM_STATS["convert_seconds"] += time.perf_counter() - t1
+                    return out
+
         if self.cache_limit_bytes <= 0:
             resident_components = {
                 component: self.expert_store.get_resident_component(self.layer_idx, component)
