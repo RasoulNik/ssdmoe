@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -32,27 +33,41 @@ class ChatRequest:
     chat_template_kwargs: dict[str, Any] | None
     response_format: dict[str, Any] | None
     session_id: str | None
+    tools: list[dict[str, Any]] | None
 
 
 def normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     normalized = []
     for message in messages:
+        role = message.get("role", "user")
         content = message.get("content", "")
         if isinstance(content, list):
-            text_parts = []
-            for fragment in content:
-                if fragment.get("type") != "text":
-                    continue
-                text_parts.append(fragment.get("text", ""))
+            text_parts = [f.get("text", "") for f in content if f.get("type") == "text"]
             content = "".join(text_parts)
         elif content is None:
             content = ""
-        normalized.append(
-            {
-                "role": message.get("role", "user"),
-                "content": content,
-            }
-        )
+        norm: dict[str, Any] = {"role": role, "content": content}
+        # Preserve tool_calls for assistant messages.
+        # Qwen3.5 template iterates tool_call.function.arguments as a dict,
+        # so parse any JSON-string arguments back to dicts.
+        if role == "assistant" and message.get("tool_calls"):
+            fixed_calls = []
+            for tc in message["tool_calls"]:
+                fn = tc.get("function", {})
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                fixed_calls.append({
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {"name": fn.get("name", ""), "arguments": args},
+                })
+            norm["tool_calls"] = fixed_calls
+        # tool_call_id is not used by the Qwen3.5 template (it just uses content)
+        normalized.append(norm)
     return normalized
 
 
@@ -62,9 +77,12 @@ def prompt_from_messages(
     *,
     enable_thinking: bool,
     chat_template_kwargs: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> str:
     kwargs = dict(chat_template_kwargs or {})
     kwargs.setdefault("enable_thinking", enable_thinking)
+    if tools:
+        kwargs["tools"] = tools
     return tokenizer.apply_chat_template(
         normalize_messages(messages),
         tokenize=False,
@@ -80,15 +98,62 @@ def prompt_tokens_from_messages(
     enable_thinking: bool,
     add_generation_prompt: bool = True,
     chat_template_kwargs: dict[str, Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> list[int]:
     kwargs = dict(chat_template_kwargs or {})
     kwargs.setdefault("enable_thinking", enable_thinking)
+    if tools:
+        kwargs["tools"] = tools
     return tokenizer.apply_chat_template(
         normalize_messages(messages),
         tokenize=True,
         add_generation_prompt=add_generation_prompt,
         **kwargs,
     )
+
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+_FUNCTION_RE = re.compile(r"<function=([^>]+)>(.*?)</function>", re.DOTALL)
+_PARAM_RE = re.compile(r"<parameter=([^>]+)>(.*?)</parameter>", re.DOTALL)
+
+
+def parse_tool_calls(text: str) -> list[dict[str, Any]] | None:
+    """Parse Qwen3.5 XML-style tool calls from generated text.
+
+    Format:
+        <tool_call>
+        <function=name>
+        <parameter=param>value</parameter>
+        </function>
+        </tool_call>
+    """
+    tc_matches = _TOOL_CALL_RE.findall(text)
+    if not tc_matches:
+        return None
+    calls = []
+    for tc_content in tc_matches:
+        fn_match = _FUNCTION_RE.search(tc_content)
+        if not fn_match:
+            continue
+        fn_name = fn_match.group(1).strip()
+        fn_body = fn_match.group(2)
+        params: dict[str, Any] = {}
+        for pm in _PARAM_RE.finditer(fn_body):
+            param_name = pm.group(1).strip()
+            param_value = pm.group(2).strip()
+            try:
+                params[param_name] = json.loads(param_value)
+            except json.JSONDecodeError:
+                params[param_name] = param_value
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:16]}",
+            "type": "function",
+            "function": {
+                "name": fn_name,
+                "arguments": json.dumps(params),
+            },
+        })
+    return calls or None
 
 
 def trim_stop(full_text: str, stop_words: list[str]) -> tuple[str, bool]:
@@ -110,10 +175,16 @@ def visible_text(full_text: str) -> str:
     close_tag = "</think>"
     stripped = full_text.lstrip()
     if close_tag in full_text:
-        return full_text.split(close_tag, 1)[1].lstrip()
-    if stripped.startswith("<"):
+        text = full_text.split(close_tag, 1)[1].lstrip()
+    elif stripped.startswith("<"):
         return ""
-    return full_text
+    else:
+        text = full_text
+    # Suppress tool_call blocks and everything after them
+    if text.startswith("<"):
+        return ""
+    tc_idx = text.find("<tool_call>")
+    return text[:tc_idx].rstrip() if tc_idx != -1 else text
 
 
 def build_system_fingerprint(model_id: str, model_path: str, top_k: int) -> str:
@@ -215,12 +286,12 @@ class RequestParser:
         n = int(body.get("n", 1))
         if n != 1:
             raise RequestValidationError("only n=1 is supported")
-        if body.get("tools"):
-            if not self.capabilities.tools:
-                raise UnsupportedFeatureError("tools are not implemented yet")
+        tools = body.get("tools") or None
+        if tools and not self.capabilities.tools:
+            raise UnsupportedFeatureError("tools are not implemented yet")
         if body.get("functions"):
             raise UnsupportedFeatureError("functions are not implemented yet")
-        if body.get("tool_choice") not in (None, "none", "auto"):
+        if body.get("tool_choice") not in (None, "none", "auto", "required"):
             raise UnsupportedFeatureError("tool_choice forcing is not implemented yet")
         response_format = self._validate_response_format(body.get("response_format"), messages)
         stop = body.get("stop") or []
@@ -245,6 +316,7 @@ class RequestParser:
             chat_template_kwargs=body.get("chat_template_kwargs"),
             response_format=response_format,
             session_id=(str(body["session_id"]) if body.get("session_id") else None),
+            tools=tools,
         )
 
 
@@ -260,9 +332,10 @@ class ChatResponseBuilder:
         request_id: str,
         created: int,
         model: str,
-        content: str,
+        content: str | None,
         finish_reason: str | None,
         usage: dict[str, Any],
+        tool_calls: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         return {
             "id": request_id,
@@ -277,7 +350,7 @@ class ChatResponseBuilder:
                         "content": content,
                         "refusal": None,
                         "annotations": [],
-                        "tool_calls": None,
+                        "tool_calls": tool_calls,
                         "function_call": None,
                     },
                     "logprobs": None,

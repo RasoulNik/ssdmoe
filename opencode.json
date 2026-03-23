@@ -28,7 +28,10 @@
       },
       "models": {
         "streamed-qwen-k4": {
-          "name": "Streamed Qwen K4"
+          "name": "Streamed Qwen K4 (thinking)"
+        },
+        "streamed-qwen-k4-nothink": {
+          "name": "Streamed Qwen K4 (fast)"
         }
       }
     }
@@ -89,6 +92,31 @@
         "grep": false,
         "edit": false,
         "write": false,
+        "patch": false,
+        "task": false,
+        "webfetch": false,
+        "websearch": false,
+        "todoread": false,
+        "todowrite": false,
+        "skill": false,
+        "question": false,
+        "plan_enter": false,
+        "plan_exit": false
+      }
+    },
+    "code": {
+      "model": "streamed/streamed-qwen-k4-nothink",
+      "mode": "primary",
+      "description": "Agentic coding mode: read/edit/run files using the local Qwen model. No thinking overhead.",
+      "prompt": "You are an expert software engineer. Use the available tools to read, edit, and run code. Be precise and concise. Prefer targeted edits over rewrites. Always read a file before editing it.",
+      "steps": 20,
+      "tools": {
+        "bash": true,
+        "read": true,
+        "glob": true,
+        "grep": true,
+        "edit": true,
+        "write": true,
         "patch": false,
         "task": false,
         "webfetch": false,
