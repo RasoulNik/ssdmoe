@@ -84,6 +84,22 @@ def parse_args() -> argparse.Namespace:
         help="Optional local draft model path for speculative decoding",
     )
     parser.add_argument(
+        "--moe-impl",
+        choices=["streamed", "pipelined"],
+        default="streamed",
+        help="Routed-expert implementation to benchmark",
+    )
+    parser.add_argument(
+        "--fused-gate-up",
+        action="store_true",
+        help="Use fused gate/up/swiglu expert execution path",
+    )
+    parser.add_argument(
+        "--compile-fused-gate-up",
+        action="store_true",
+        help="Use mx.compile for fused gate/up/swiglu when enabled",
+    )
+    parser.add_argument(
         "--num-draft-tokens",
         type=int,
         default=2,
@@ -143,6 +159,9 @@ def main() -> None:
             native_reader_path=Path(args.native_reader) if args.native_reader else None,
             resident_small_components=args.resident_small_components,
             component_workers=args.component_workers,
+            moe_impl=args.moe_impl,
+            fused_gate_up=args.fused_gate_up,
+            compile_fused_gate_up=args.compile_fused_gate_up,
         )
         try:
             if args.warmup_tokens > 0:
@@ -190,6 +209,9 @@ def main() -> None:
             "component_workers": args.component_workers,
             "draft_model": args.draft_model,
             "num_draft_tokens": args.num_draft_tokens,
+            "moe_impl": args.moe_impl,
+            "fused_gate_up": args.fused_gate_up,
+            "compile_fused_gate_up": args.compile_fused_gate_up,
         }
         if expert_store.stats["read_seconds"] > 0:
             result["expert_read_gbps"] = (

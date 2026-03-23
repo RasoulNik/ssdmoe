@@ -39,6 +39,22 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to native expert reader dylib",
     )
+    parser.add_argument(
+        "--moe-impl",
+        choices=["streamed", "pipelined"],
+        default="streamed",
+        help="Routed-expert implementation to use",
+    )
+    parser.add_argument(
+        "--fused-gate-up",
+        action="store_true",
+        help="Use fused gate/up/swiglu expert execution path",
+    )
+    parser.add_argument(
+        "--compile-fused-gate-up",
+        action="store_true",
+        help="Use mx.compile for fused gate/up/swiglu when enabled",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +67,9 @@ def main() -> None:
         cache_limit_bytes=args.expert_cache_mb * 1024 * 1024,
         use_nocache=args.nocache,
         native_reader_path=Path(args.native_reader) if args.native_reader else None,
+        moe_impl=args.moe_impl,
+        fused_gate_up=args.fused_gate_up,
+        compile_fused_gate_up=args.compile_fused_gate_up,
     )
     try:
         generate(

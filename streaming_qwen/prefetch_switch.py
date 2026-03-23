@@ -15,12 +15,11 @@ import numpy as np
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm.models.activations import swiglu
-
 from .expert_store import ExpertStore
 from .streamed_switch import (
     STREAM_STATS,
     _blob_to_mx,
+    _compute_expert_output,
     _component_to_mx,
     _remap_indices,
 )
@@ -129,6 +128,8 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         mode: str = "affine",
+        fused_gate_up: bool = False,
+        compile_fused_gate_up: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -137,6 +138,8 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
+        self.fused_gate_up = fused_gate_up
+        self.compile_fused_gate_up = compile_fused_gate_up
         # Track last selected experts for speculation
         self._last_selected: list[int] = []
         self._stats = {
@@ -211,56 +214,16 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
         # Store for speculation
         self._last_selected = selected
 
-        x = mx.expand_dims(x, (-2, -3))
-        t1 = time.perf_counter()
-        x_up = mx.gather_qmm(
+        return _compute_expert_output(
             x,
-            tensors["up_proj.weight"],
-            tensors["up_proj.scales"],
-            tensors["up_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
+            tensors,
+            local_indices,
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
-            sorted_indices=False,
+            fused_gate_up=self.fused_gate_up,
+            compile_fused_gate_up=self.compile_fused_gate_up,
         )
-        STREAM_STATS["qmm_up_seconds"] += time.perf_counter() - t1
-
-        t2 = time.perf_counter()
-        x_gate = mx.gather_qmm(
-            x,
-            tensors["gate_proj.weight"],
-            tensors["gate_proj.scales"],
-            tensors["gate_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=False,
-        )
-        STREAM_STATS["qmm_gate_seconds"] += time.perf_counter() - t2
-
-        t3 = time.perf_counter()
-        activated = swiglu(x_gate, x_up)
-        STREAM_STATS["swiglu_seconds"] += time.perf_counter() - t3
-
-        t4 = time.perf_counter()
-        x_down = mx.gather_qmm(
-            activated,
-            tensors["down_proj.weight"],
-            tensors["down_proj.scales"],
-            tensors["down_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=False,
-        )
-        STREAM_STATS["qmm_down_seconds"] += time.perf_counter() - t4
-        return x_down.squeeze(-2)
 
 
 def get_prefetch_stats(switches: list[PrefetchingStreamedSwitchGLU]) -> dict:

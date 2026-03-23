@@ -44,6 +44,9 @@ class StreamedModelSession:
             native_reader_path=self.native_reader_path,
             component_workers=args.component_workers,
             use_prefetch=args.enable_prefetch,
+            moe_impl=args.moe_impl,
+            fused_gate_up=args.fused_gate_up,
+            compile_fused_gate_up=args.compile_fused_gate_up,
         )
         self.model_id = args.served_model_id or f"streamed-qwen-k{args.routed_top_k}"
         self.system_fingerprint = build_system_fingerprint(

@@ -83,6 +83,22 @@ def parse_args() -> argparse.Namespace:
         help="Disable same-layer speculative expert prefetch",
     )
     parser.add_argument(
+        "--moe-impl",
+        choices=["streamed", "pipelined"],
+        default="streamed",
+        help="Routed-expert implementation to use",
+    )
+    parser.add_argument(
+        "--fused-gate-up",
+        action="store_true",
+        help="Use fused gate/up/swiglu expert execution path",
+    )
+    parser.add_argument(
+        "--compile-fused-gate-up",
+        action="store_true",
+        help="Use mx.compile for fused gate/up/swiglu when enabled",
+    )
+    parser.add_argument(
         "--prefill-step-size",
         type=int,
         default=512,

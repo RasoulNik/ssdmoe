@@ -12,6 +12,7 @@ from .model_io import (
     load_expert_aux_weights,
     load_non_expert_text_weights,
 )
+from .pipelined_moe import patch_pipelined_moe
 from .prefetch_switch import PrefetchManager, PrefetchingStreamedSwitchGLU
 from .streamed_switch import StreamedSwitchGLU
 
@@ -35,6 +36,8 @@ def _patch_streamed_switches(
     quantization: dict,
     cache_limit_bytes: int = 0,
     use_prefetch: bool = False,
+    fused_gate_up: bool = False,
+    compile_fused_gate_up: bool = False,
 ) -> None:
     layers = list(iter_moe_layers(model))
     prefetch_manager = (
@@ -52,6 +55,8 @@ def _patch_streamed_switches(
                 group_size=quantization.get("group_size", 64),
                 bits=quantization.get("bits", 4),
                 mode=quantization.get("mode", "affine"),
+                fused_gate_up=fused_gate_up,
+                compile_fused_gate_up=compile_fused_gate_up,
             )
         else:
             mlp.switch_mlp = StreamedSwitchGLU(
@@ -61,6 +66,8 @@ def _patch_streamed_switches(
                 bits=quantization.get("bits", 4),
                 mode=quantization.get("mode", "affine"),
                 cache_limit_bytes=cache_limit_bytes,
+                fused_gate_up=fused_gate_up,
+                compile_fused_gate_up=compile_fused_gate_up,
             )
     expert_store.prefetch_manager = prefetch_manager
 
@@ -94,6 +101,9 @@ def build_streamed_model(
     resident_small_components: bool = False,
     component_workers: int = 3,
     use_prefetch: bool = False,
+    moe_impl: str = "streamed",
+    fused_gate_up: bool = False,
+    compile_fused_gate_up: bool = False,
 ):
     model_path = Path(model_path).expanduser().resolve()
     index_path = Path(index_path).expanduser().resolve()
@@ -115,13 +125,17 @@ def build_streamed_model(
     expert_store.open()
 
     available_weight_names = set(list_non_expert_text_tensors(model_path))
-    _patch_streamed_switches(
-        model,
-        expert_store,
-        config.get("quantization") or config.get("quantization_config") or {},
-        cache_limit_bytes=cache_limit_bytes,
-        use_prefetch=use_prefetch,
-    )
+    quantization = config.get("quantization") or config.get("quantization_config") or {}
+    if moe_impl != "pipelined":
+        _patch_streamed_switches(
+            model,
+            expert_store,
+            quantization,
+            cache_limit_bytes=cache_limit_bytes,
+            use_prefetch=use_prefetch,
+            fused_gate_up=fused_gate_up,
+            compile_fused_gate_up=compile_fused_gate_up,
+        )
     _quantize_resident_modules(model, config, available_weight_names)
 
     weights = load_non_expert_text_weights(model_path)
@@ -130,6 +144,15 @@ def build_streamed_model(
     model.load_weights(list(weights.items()), strict=False)
     model.eval()
     mx.eval(model.parameters())
+
+    if moe_impl == "pipelined":
+        patch_pipelined_moe(
+            model,
+            expert_store,
+            quantization,
+            fused_gate_up=fused_gate_up,
+            compile_fused_gate_up=compile_fused_gate_up,
+        )
 
     if top_k is not None:
         set_routed_top_k(model, top_k)

@@ -75,6 +75,90 @@ def _remap_indices(indices: mx.array, selected_experts: list[int]) -> mx.array:
     return mx.asarray(remapped.astype(np.int32))
 
 
+def _compute_expert_output(
+    x: mx.array,
+    tensors: dict[str, mx.array],
+    local_indices: mx.array,
+    *,
+    group_size: int,
+    bits: int,
+    mode: str,
+    fused_gate_up: bool = False,
+    compile_fused_gate_up: bool = False,
+) -> mx.array:
+    if fused_gate_up:
+        from .fused_expert import compute_expert_output_fused
+
+        return compute_expert_output_fused(
+            x,
+            tensors,
+            local_indices,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            use_compiled=compile_fused_gate_up,
+        )
+
+    x = mx.expand_dims(x, (-2, -3))
+    t1 = time.perf_counter()
+    x_up = mx.gather_qmm(
+        x,
+        tensors["up_proj.weight"],
+        tensors["up_proj.scales"],
+        tensors["up_proj.biases"],
+        rhs_indices=local_indices,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        sorted_indices=False,
+    )
+    if PROFILE_STREAMED:
+        mx.eval(x_up)
+    STREAM_STATS["qmm_up_seconds"] += time.perf_counter() - t1
+
+    t2 = time.perf_counter()
+    x_gate = mx.gather_qmm(
+        x,
+        tensors["gate_proj.weight"],
+        tensors["gate_proj.scales"],
+        tensors["gate_proj.biases"],
+        rhs_indices=local_indices,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        sorted_indices=False,
+    )
+    if PROFILE_STREAMED:
+        mx.eval(x_gate)
+    STREAM_STATS["qmm_gate_seconds"] += time.perf_counter() - t2
+
+    t3 = time.perf_counter()
+    activated = swiglu(x_gate, x_up)
+    if PROFILE_STREAMED:
+        mx.eval(activated)
+    STREAM_STATS["swiglu_seconds"] += time.perf_counter() - t3
+
+    t4 = time.perf_counter()
+    x_down = mx.gather_qmm(
+        activated,
+        tensors["down_proj.weight"],
+        tensors["down_proj.scales"],
+        tensors["down_proj.biases"],
+        rhs_indices=local_indices,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
+        mode=mode,
+        sorted_indices=False,
+    )
+    if PROFILE_STREAMED:
+        mx.eval(x_down)
+    STREAM_STATS["qmm_down_seconds"] += time.perf_counter() - t4
+    return x_down.squeeze(-2)
+
+
 class StreamedSwitchGLU(nn.Module):
     """Flash-moe-style routed expert block backed by on-demand `pread()`."""
 
@@ -86,6 +170,8 @@ class StreamedSwitchGLU(nn.Module):
         bits: int = 4,
         mode: str = "affine",
         cache_limit_bytes: int = 0,
+        fused_gate_up: bool = False,
+        compile_fused_gate_up: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -94,6 +180,8 @@ class StreamedSwitchGLU(nn.Module):
         self.bits = bits
         self.mode = mode
         self.cache_limit_bytes = cache_limit_bytes
+        self.fused_gate_up = fused_gate_up
+        self.compile_fused_gate_up = compile_fused_gate_up
         self._cache: OrderedDict[tuple[int, int], tuple[dict[str, mx.array], int]] = OrderedDict()
         self._cache_bytes = 0
 
@@ -233,62 +321,13 @@ class StreamedSwitchGLU(nn.Module):
         local_indices = _remap_indices(indices, selected)
         STREAM_STATS["remap_seconds"] += time.perf_counter() - t0
         tensors = self._load_selected(selected)
-
-        x = mx.expand_dims(x, (-2, -3))
-        t1 = time.perf_counter()
-        x_up = mx.gather_qmm(
+        return _compute_expert_output(
             x,
-            tensors["up_proj.weight"],
-            tensors["up_proj.scales"],
-            tensors["up_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
+            tensors,
+            local_indices,
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
-            sorted_indices=False,
+            fused_gate_up=self.fused_gate_up,
+            compile_fused_gate_up=self.compile_fused_gate_up,
         )
-        if PROFILE_STREAMED:
-            mx.eval(x_up)
-        STREAM_STATS["qmm_up_seconds"] += time.perf_counter() - t1
-
-        t2 = time.perf_counter()
-        x_gate = mx.gather_qmm(
-            x,
-            tensors["gate_proj.weight"],
-            tensors["gate_proj.scales"],
-            tensors["gate_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=False,
-        )
-        if PROFILE_STREAMED:
-            mx.eval(x_gate)
-        STREAM_STATS["qmm_gate_seconds"] += time.perf_counter() - t2
-
-        t3 = time.perf_counter()
-        activated = swiglu(x_gate, x_up)
-        if PROFILE_STREAMED:
-            mx.eval(activated)
-        STREAM_STATS["swiglu_seconds"] += time.perf_counter() - t3
-
-        t4 = time.perf_counter()
-        x_down = mx.gather_qmm(
-            activated,
-            tensors["down_proj.weight"],
-            tensors["down_proj.scales"],
-            tensors["down_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=False,
-        )
-        if PROFILE_STREAMED:
-            mx.eval(x_down)
-        STREAM_STATS["qmm_down_seconds"] += time.perf_counter() - t4
-        return x_down.squeeze(-2)

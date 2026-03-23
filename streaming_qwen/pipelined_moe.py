@@ -24,13 +24,12 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
-from mlx_lm.models.activations import swiglu
-
 from .expert_store import ExpertStore
 from .streamed_switch import (
     STREAM_STATS,
     PROFILE_STREAMED,
     _blob_to_mx,
+    _compute_expert_output,
     _remap_indices,
 )
 
@@ -45,6 +44,8 @@ class PipelinedStreamedSwitchGLU(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         mode: str = "affine",
+        fused_gate_up: bool = False,
+        compile_fused_gate_up: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -52,6 +53,8 @@ class PipelinedStreamedSwitchGLU(nn.Module):
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
+        self.fused_gate_up = fused_gate_up
+        self.compile_fused_gate_up = compile_fused_gate_up
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._pending_load: Optional[Future] = None
         self._pending_experts: Optional[list[int]] = None
@@ -102,69 +105,18 @@ class PipelinedStreamedSwitchGLU(nn.Module):
             tensors[component] = _blob_to_mx(payload[component], info, len(selected))
             STREAM_STATS["convert_seconds"] += time.perf_counter() - t1
 
-        # Compute
-        x = mx.expand_dims(x, (-2, -3))
-
-        t1 = time.perf_counter()
-        x_up = mx.gather_qmm(
-            x,
-            tensors["up_proj.weight"],
-            tensors["up_proj.scales"],
-            tensors["up_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=False,
-        )
-        if PROFILE_STREAMED:
-            mx.eval(x_up)
-        STREAM_STATS["qmm_up_seconds"] += time.perf_counter() - t1
-
-        t2 = time.perf_counter()
-        x_gate = mx.gather_qmm(
-            x,
-            tensors["gate_proj.weight"],
-            tensors["gate_proj.scales"],
-            tensors["gate_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=False,
-        )
-        if PROFILE_STREAMED:
-            mx.eval(x_gate)
-        STREAM_STATS["qmm_gate_seconds"] += time.perf_counter() - t2
-
-        t3 = time.perf_counter()
-        activated = swiglu(x_gate, x_up)
-        if PROFILE_STREAMED:
-            mx.eval(activated)
-        STREAM_STATS["swiglu_seconds"] += time.perf_counter() - t3
-
-        t4 = time.perf_counter()
-        x_down = mx.gather_qmm(
-            activated,
-            tensors["down_proj.weight"],
-            tensors["down_proj.scales"],
-            tensors["down_proj.biases"],
-            rhs_indices=local_indices,
-            transpose=True,
-            group_size=self.group_size,
-            bits=self.bits,
-            mode=self.mode,
-            sorted_indices=False,
-        )
-        if PROFILE_STREAMED:
-            mx.eval(x_down)
-        STREAM_STATS["qmm_down_seconds"] += time.perf_counter() - t4
-
         self._pending_load = None
         self._pending_experts = None
-        return x_down.squeeze(-2)
+        return _compute_expert_output(
+            x,
+            tensors,
+            local_indices,
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
+            fused_gate_up=self.fused_gate_up,
+            compile_fused_gate_up=self.compile_fused_gate_up,
+        )
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
         """Standard call interface (not pipelined)."""
@@ -188,6 +140,8 @@ class PipelinedSparseMoeBlock(nn.Module):
         layer_idx: int,
         expert_store: ExpertStore,
         quantization: dict,
+        fused_gate_up: bool = False,
+        compile_fused_gate_up: bool = False,
     ):
         super().__init__()
         # Copy attributes from original
@@ -207,6 +161,8 @@ class PipelinedSparseMoeBlock(nn.Module):
             group_size=quantization.get("group_size", 64),
             bits=quantization.get("bits", 4),
             mode=quantization.get("mode", "affine"),
+            fused_gate_up=fused_gate_up,
+            compile_fused_gate_up=compile_fused_gate_up,
         )
 
         self.sharding_group = getattr(original_moe_block, "sharding_group", None)
@@ -249,6 +205,8 @@ def patch_pipelined_moe(
     model,
     expert_store: ExpertStore,
     quantization: dict,
+    fused_gate_up: bool = False,
+    compile_fused_gate_up: bool = False,
 ) -> None:
     """Replace SparseMoeBlock with PipelinedSparseMoeBlock in the model."""
     patched_count = 0
@@ -266,6 +224,8 @@ def patch_pipelined_moe(
             layer_idx=layer_idx,
             expert_store=expert_store,
             quantization=quantization,
+            fused_gate_up=fused_gate_up,
+            compile_fused_gate_up=compile_fused_gate_up,
         )
 
         layer.mlp = pipelined

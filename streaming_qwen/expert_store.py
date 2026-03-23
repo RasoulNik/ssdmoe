@@ -37,7 +37,6 @@ class ExpertStore:
             NativeExpertReader(native_reader_path) if native_reader_path else None
         )
         self.resident_components = resident_components or {}
-        self.component_workers = max(1, component_workers)
         self.reset_stats()
 
     def reset_stats(self) -> None:
@@ -127,32 +126,64 @@ class ExpertStore:
         selected_components = components or list(layer_info.keys())
         t0 = time.perf_counter()
 
-        def _read_component(item: tuple[str, dict]) -> tuple[str, memoryview, int]:
-            component, info = item
-            fd = self._fds[info["file"]]
-            mv = self.native_reader.read_component_batch(
-                fd=fd,
-                abs_offset=info["abs_offset"],
-                expert_stride=info["expert_stride"],
-                expert_size=info["expert_size"],
-                expert_indices=expert_indices,
-            )
-            return component, mv, info["expert_size"] * len(expert_indices)
+        specs = []
+        total_bytes = 0
+        for component in selected_components:
+            info = layer_info[component]
+            specs.append((
+                component,
+                self._fds[info["file"]],
+                info["abs_offset"],
+                info["expert_stride"],
+                info["expert_size"],
+            ))
+            total_bytes += info["expert_size"] * len(expert_indices)
 
-        workers = min(len(selected_components), self.component_workers)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results = list(
-                pool.map(
-                    _read_component,
-                    [(component, layer_info[component]) for component in selected_components],
-                )
-            )
-
-        out = {}
-        for component, mv, size in results:
-            out[component] = mv
-            self.stats["component_reads"] += len(expert_indices)
-            self.stats["bytes_read"] += size
+        out = self.native_reader.read_component_batches(specs, expert_indices)
+        self.stats["component_reads"] += len(selected_components) * len(expert_indices)
+        self.stats["bytes_read"] += total_bytes
         self.stats["expert_reads"] += len(expert_indices)
         self.stats["read_seconds"] += time.perf_counter() - t0
         return out
+
+    def read_components_batched_into_slots(
+        self,
+        layer_idx: int,
+        expert_indices: list[int],
+        slot_indices: list[int],
+        out_buffers: dict[str, object],
+        components: list[str] | None = None,
+    ) -> None:
+        if self.native_reader is None:
+            raise RuntimeError("native reader not configured")
+        if len(expert_indices) != len(slot_indices):
+            raise ValueError("slot_indices length must match expert_indices length")
+        if not expert_indices:
+            return
+
+        layer_info = self.expert_reads[str(layer_idx)]
+        selected_components = components or list(layer_info.keys())
+        specs = [
+            (
+                component,
+                self._fds[layer_info[component]["file"]],
+                layer_info[component]["abs_offset"],
+                layer_info[component]["expert_stride"],
+                layer_info[component]["expert_size"],
+            )
+            for component in selected_components
+        ]
+        t0 = time.perf_counter()
+        self.native_reader.read_component_batches_into_slots(
+            specs=specs,
+            expert_indices=expert_indices,
+            slot_indices=slot_indices,
+            out_buffers=out_buffers,
+        )
+        self.stats["component_reads"] += len(expert_indices) * len(selected_components)
+        self.stats["bytes_read"] += sum(
+            layer_info[component]["expert_size"] * len(expert_indices)
+            for component in selected_components
+        )
+        self.stats["expert_reads"] += len(expert_indices)
+        self.stats["read_seconds"] += time.perf_counter() - t0
