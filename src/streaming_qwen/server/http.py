@@ -378,6 +378,14 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
             cache_key = prompt_tokens[:]
             if cache is None:
                 cache = make_prompt_cache(session.model)
+            # Snapshot the base cache before it is mutated by prefill.
+            # By the time _save_end_of_turn_checkpoint runs, 'cache' has been
+            # mutated (think-injection tokens baked in).  The snapshot lets
+            # _save_end_of_turn_checkpoint use this as a base for the
+            # history-compatible EOT re-prefill even if the matched LRU entry
+            # is evicted during T2's own insert_cache calls.
+            eot_hint_cache = copy.deepcopy(cache) if cached_tokens > 0 else None
+            eot_hint_tokens = cached_tokens
             prefilled_tokens = 0
 
             # --- System-prefix checkpoint ---
@@ -528,10 +536,9 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                         getattr(last_response, "generation_tps", 0),
                     )
                 # Store history-compatible checkpoint BEFORE insert_cache(cache_key, cache).
-                # insert_cache with checkpoint=False can evict the oldest checkpoint (e.g.
-                # system+tools) from memory.  _save_end_of_turn_checkpoint needs that checkpoint
-                # as a base for re-prefill — if it's already evicted we re-prefill from scratch
-                # (7530 tokens, 150s) instead of from the existing base (~2000 tokens, ~40s).
+                # eot_hint_cache (snapshotted above before prefill) is passed as a fallback so
+                # _save_end_of_turn_checkpoint can use it if the T(N-1) EOT checkpoint was
+                # evicted from the in-memory LRU during T2's own insert_cache calls.
                 self._save_end_of_turn_checkpoint(
                     session=session,
                     request=request,
@@ -539,6 +546,8 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
                     cache_key=cache_key,
                     enable_thinking=enable_thinking,
                     prefill_step_size=self._args().prefill_step_size,
+                    hint_cache=eot_hint_cache,
+                    hint_tokens=eot_hint_tokens,
                 )
                 # Store the full generation cache (may evict oldest checkpoint).
                 session.prompt_cache.insert_cache(session.cache_namespace, cache_key, cache)
@@ -561,6 +570,8 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
         cache_key: list[int],
         enable_thinking: bool,
         prefill_step_size: int,
+        hint_cache: list | None = None,
+        hint_tokens: int = 0,
     ) -> None:
         """Store a KV cache checkpoint keyed to how this turn appears in future history.
 
@@ -616,6 +627,22 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
         )
         if not eot_rest:
             return  # already cached exactly
+        # If the LRU found a shorter match than the start-of-turn hint (because
+        # the T(N-1) EOT checkpoint was evicted by this turn's insert_cache calls),
+        # fall back to the hint.  It captured the cache state right after
+        # fetch_nearest_cache at the top of _generate — before any evictions.
+        lru_match = len(end_of_turn_tokens) - len(eot_rest)
+        if (
+            hint_cache is not None
+            and hint_tokens > lru_match
+            and end_of_turn_tokens[:hint_tokens] == prompt_tokens[:hint_tokens]
+        ):
+            logging.debug(
+                "EOT hint fallback: hint=%d tokens > lru=%d tokens; re-prefilling %d",
+                hint_tokens, lru_match, len(end_of_turn_tokens) - hint_tokens,
+            )
+            eot_cache = hint_cache
+            eot_rest = end_of_turn_tokens[hint_tokens:]
         if eot_cache is None:
             eot_cache = make_prompt_cache(session.model)
         self._prefill_prompt_prefix(
