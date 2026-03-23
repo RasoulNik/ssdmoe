@@ -63,8 +63,8 @@ def parse_args():
     p.add_argument("--native-reader", required=True)
     p.add_argument("--k", type=int, default=4)
     p.add_argument("--window-tokens", type=int, default=2)
-    p.add_argument("--tests", default="A,B,C",
-                   help="Comma-separated list of tests to run (A, B, C)")
+    p.add_argument("--tests", default="A,B,C,D",
+                   help="Comma-separated list of tests to run (A, B, C, D)")
     return p.parse_args()
 
 
@@ -306,6 +306,43 @@ def test_c(args, model, tokenizer, expert_store, config, prompt_tokens):
 
 
 # ---------------------------------------------------------------------------
+# Test D: fused gate+up + session cache combined (stacked gains)
+# ---------------------------------------------------------------------------
+
+def test_d(args, model, tokenizer, expert_store, config, prompt_tokens):
+    print("\n" + "=" * 60)
+    print("TEST D — Combined: fused gate+up + session-window cache")
+    print("=" * 60)
+
+    q = config.get("quantization") or {}
+    results = {}
+
+    # D1: baseline — separate gate+up, no cache (same as A1/B1)
+    patch_layers(model, expert_store, fused_gate_up=False, compile_fused=False,
+                 session_cache=None, quantization=q, top_k=args.k)
+    r = run_decode(model, tokenizer, expert_store, prompt_tokens=prompt_tokens,
+                   max_tokens=MAX_TOKENS, session_cache=None, top_k=args.k, label="baseline")
+    results["baseline"] = r
+    print(f"  baseline (separate, no cache):  {r['tok_s']:.3f} tok/s  {r['ssd_gb']:.2f} GB")
+
+    # D2: combined — fused gate+up + session cache H=window_tokens
+    sc = SessionWindowNativeCache(max_bytes=2 * 1024**3, window_tokens=args.window_tokens)
+    patch_layers(model, expert_store, fused_gate_up=True, compile_fused=False,
+                 session_cache=sc, quantization=q, top_k=args.k)
+    r = run_decode(model, tokenizer, expert_store, prompt_tokens=prompt_tokens,
+                   max_tokens=MAX_TOKENS, session_cache=sc, top_k=args.k,
+                   label=f"fused+cache_H{args.window_tokens}")
+    results["combined"] = r
+    print(f"  fused + cache H{args.window_tokens}:              "
+          f"{r['tok_s']:.3f} tok/s  {r['ssd_gb']:.2f} GB  hit={r.get('hit_rate', 0):.1%}")
+
+    base = results["baseline"]["tok_s"]
+    combo = results["combined"]["tok_s"]
+    print(f"\n  combined delta vs baseline: {(combo-base)/base*100:+.1f}%")
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -334,6 +371,8 @@ def main():
         results["B"] = test_b(args, model, tokenizer, expert_store, config, prompt_tokens)
     if "C" in tests:
         results["C"] = test_c(args, model, tokenizer, expert_store, config, prompt_tokens)
+    if "D" in tests:
+        results["D"] = test_d(args, model, tokenizer, expert_store, config, prompt_tokens)
 
     print("\n" + "=" * 60)
     print("SUMMARY")
@@ -356,6 +395,13 @@ def main():
         print(f"  Batch read:     ThreadPool {tp['median_ms']:.1f}ms  "
               f"native {nb['median_ms']:.1f}ms  "
               f"({(tp['median_ms']-nb['median_ms'])/tp['median_ms']*100:+.1f}% faster)")
+    if "D" in results:
+        d = results["D"]
+        base_tps = d["baseline"]["tok_s"]
+        combo_tps = d["combined"]["tok_s"]
+        print(f"  Combined:       {base_tps:.3f} → {combo_tps:.3f} tok/s  "
+              f"({(combo_tps-base_tps)/base_tps*100:+.1f}%)  "
+              f"hit={d['combined'].get('hit_rate', 0):.1%}")
 
     expert_store.close()
 
