@@ -517,6 +517,20 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
             finally:
                 session.set_top_k(session.decode_top_k)
                 session.prompt_cache.insert_cache(session.cache_namespace, cache_key, cache)
+                # Store a history-compatible checkpoint so multi-turn conversations get a
+                # cache hit at the full conversation prefix, not just at the system prompt.
+                # Qwen3's template injects <think>\n\n</think>\n\n into the generation prompt
+                # when enable_thinking=False, which ends up in cache_key but NOT in future
+                # turns' history encoding — breaking prefix matching.  Re-prefill without
+                # those tokens and store at the history-compatible key.
+                self._save_end_of_turn_checkpoint(
+                    session=session,
+                    request=request,
+                    prompt_tokens=prompt_tokens,
+                    cache_key=cache_key,
+                    enable_thinking=enable_thinking,
+                    prefill_step_size=self._args().prefill_step_size,
+                )
                 # Flush queued checkpoint saves NOW — inference is done, Metal is idle.
                 # save_prompt_cache issues Metal GPU→CPU blits; running it here (on the
                 # handler thread, after stream_generate) avoids concurrent Metal access.
@@ -526,6 +540,92 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
             "prompt_tokens": len(prompt_tokens),
             "cached_tokens": cached_tokens,
         }
+
+    def _save_end_of_turn_checkpoint(
+        self,
+        *,
+        session: StreamedModelSession,
+        request: Any,
+        prompt_tokens: list[int],
+        cache_key: list[int],
+        enable_thinking: bool,
+        prefill_step_size: int,
+    ) -> None:
+        """Store a KV cache checkpoint keyed to how this turn appears in future history.
+
+        When enable_thinking=False, Qwen3's template injects <think>\\n\\n</think>\\n\\n tokens
+        into the generation prompt.  These appear in cache_key but NOT in how the assistant
+        turn is encoded in subsequent conversation history (template line 103 omits them for
+        non-final turns).  Without this fix, turn N+1 can only reuse the cache up to the
+        system+user block; the full assistant response must be re-prefilled every turn.
+
+        Fix: decode the generated tokens, re-tokenize the completed turn as it will appear
+        in history (no think injection), fetch the nearest existing checkpoint as a base,
+        prefill the gap, and store a new checkpoint at the history-compatible key.
+        """
+        generated_ids = cache_key[len(prompt_tokens):]
+        if not generated_ids:
+            return
+        assistant_text = session.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        if not assistant_text.strip():
+            return
+        history_messages = list(request.messages) + [{"role": "assistant", "content": assistant_text}]
+        try:
+            # Append two dummy user variants so the template treats the assistant as a
+            # history turn (loop.index0 <= last_query_index) rather than the final turn.
+            # Without a subsequent user message, Qwen3's template injects
+            # <think>\n\n</think>\n\n into the assistant block even with enable_thinking=False,
+            # matching the generation-prompt injection but NOT what future turns encode.
+            _dummy_base = dict(
+                enable_thinking=enable_thinking,
+                add_generation_prompt=False,
+                chat_template_kwargs=request.chat_template_kwargs,
+                tools=request.tools,
+            )
+            _d1 = prompt_tokens_from_messages(
+                session.tokenizer, history_messages + [{"role": "user", "content": ""}], **_dummy_base
+            )
+            _d2 = prompt_tokens_from_messages(
+                session.tokenizer, history_messages + [{"role": "user", "content": "."}], **_dummy_base
+            )
+            D = next(
+                (i for i, (a, b) in enumerate(zip(_d1, _d2)) if a != b),
+                min(len(_d1), len(_d2)),
+            )
+            # Strip <|im_start|>user\n (3 tokens) before divergence to isolate the
+            # history-compatible assistant block end (through <|im_end|>\n).
+            if D < 3:
+                return
+            end_of_turn_tokens = _d1[:D - 3]
+        except Exception:
+            return
+
+        eot_cache, eot_rest = session.prompt_cache.fetch_nearest_cache(
+            session.cache_namespace, end_of_turn_tokens
+        )
+        if not eot_rest:
+            return  # already cached exactly
+        if eot_cache is None:
+            eot_cache = make_prompt_cache(session.model)
+        self._prefill_prompt_prefix(
+            tokens=eot_rest,
+            cache=eot_cache,
+            step_size=prefill_step_size,
+            model=session.model,
+            session=session,
+            top_k=session.prefill_top_k,
+        )
+        session.prompt_cache.insert_cache(
+            session.cache_namespace,
+            end_of_turn_tokens,
+            copy.deepcopy(eot_cache),
+            checkpoint=True,
+        )
+        logging.info(
+            "end-of-turn checkpoint stored: %d tokens (re-prefilled %d without think injection)",
+            len(end_of_turn_tokens),
+            len(eot_rest),
+        )
 
     def _handle_chat(self, request, *, started_at: float) -> None:
         request_id = build_request_id("chatcmpl")
