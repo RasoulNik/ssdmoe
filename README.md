@@ -1,7 +1,14 @@
 # Qwen3.5-35B Streaming MoE Server
 
-Runs **Qwen3.5-35B-A3B** (35B total params, 3B active per token) on a **16 GB M4 MacBook Air**
-via on-demand expert streaming — no full model load into RAM, no second copy of weights on disk.
+Runs **Qwen3.5-35B-A3B** on a **16 GB M4 MacBook Air** via on-demand expert streaming —
+no full model load into RAM, no second copy of weights on disk.
+
+**Qwen3.5-35B-A3B is a Mixture-of-Experts (MoE) model.** Each of its 40 transformer layers
+contains 256 specialist sub-networks called *experts*. For every token, a learned router
+selects K of those 256 experts to run — the other 252 are skipped entirely. With the
+training default of K=8, only ~3B of the 35B parameters are active per token. This server
+lets you tune K at runtime: lower K = fewer experts loaded from SSD = faster tokens, at some
+cost to output quality.
 
 ## Performance
 
@@ -162,16 +169,27 @@ Example — enable persistent KV cache:
 KV_CACHE_DIR=.run/kv-cache ./scripts/streamed-qwen-server.sh start
 ```
 
-## K Parameter
+## K — Number of Active Experts
 
-`ROUTED_TOP_K` controls how many of the 128 experts are loaded per token per layer.
-The model was trained with K=8 (full routing). Lower K trades output quality for speed:
+Each token's forward pass routes through K of the 256 experts in every MoE layer.
+The model was trained with K=8, which activates ~3B parameters per token and gives
+full output quality. This server streams only the K chosen expert shards from SSD on
+each token, so reducing K directly reduces both I/O and compute:
 
-| K | Approx tok/s | Notes |
-|---|-------------|-------|
-| 8 | ~5–6 | Full model quality |
-| 4 | ~10–12 | Default — good quality/speed balance |
-| 2 | ~18–22 | Noticeably degraded quality |
+```
+Per token: 40 layers × K experts × 3 components (gate, up, down) read from SSD
+K=8 → 960 expert-component reads / token
+K=4 → 480 expert-component reads / token  (2× faster I/O)
+K=2 → 240 expert-component reads / token  (4× faster I/O, quality degrades)
+```
+
+| K | Active params/token | Fresh-process tok/s | Notes |
+|---|--------------------|--------------------|-------|
+| 8 | ~3.0 B (trained default) | ~4–5 | Full quality |
+| 4 | ~1.5 B | **7–8** | Default here — good balance |
+| 2 | ~0.75 B | ~14–16 | Noticeably degraded |
+
+Set via `ROUTED_TOP_K` environment variable before starting the server.
 
 ## OpenAI Compatibility
 
