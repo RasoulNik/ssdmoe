@@ -1,0 +1,6 @@
+.run
+.external/
+.venv/
+.open-webui-venv/
+.webui_secret_key
+__pycache__/
