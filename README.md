@@ -10,7 +10,7 @@ via on-demand expert streaming — no full model load into RAM, no second copy o
 | Decode throughput (K=4, fresh process) | **7–8 tok/s** |
 | Decode throughput (K=4, warm server) | **10–12 tok/s** |
 | Prefill speed — cold start (bench) | ~75 tok/s |
-| Prefill speed — server (with step overhead) | ~38 tok/s |
+| Prefill speed — server (with step overhead) | ~52 tok/s |
 | Multi-turn KV cache hit rate | **97–98%+** |
 | Active memory (server runtime) | ~1 GB |
 | Peak memory (during prefill) | ~2.5 GB |
@@ -21,8 +21,9 @@ Platform: Apple M4 MacBook Air, 16 GB unified memory, internal SSD (~5.6 GB/s su
 > Decode throughput scales with OS page cache warmth. A freshly started process reads
 > expert shards from SSD on every token (~7–8 tok/s). After a long-running session, the
 > OS has hot-cached frequently used expert shards in RAM, reaching 10–12 tok/s.
-> The server step overhead in prefill (intermediate `mx.clear_cache()` calls between
-> 1024-token chunks) halves raw prefill throughput vs the bench script.
+> The server step overhead in prefill (one `mx.clear_cache()` call per 4096-token chunk)
+> costs ~30% vs the bench script. Chunk size is tunable via `PREFILL_STEP_SIZE`; 4096 is
+> safe on this machine (peak Metal memory 5.3 GB vs 16 GB available).
 
 ## Architecture
 
