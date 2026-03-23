@@ -591,7 +591,17 @@ class StreamedAPIHandler(BaseHTTPRequestHandler):
         assistant_text = session.tokenizer.decode(generated_ids, skip_special_tokens=True)
         if not assistant_text.strip():
             return
-        history_messages = list(request.messages) + [{"role": "assistant", "content": assistant_text}]
+        # Build the assistant history message in the same format the client will send
+        # in the next request.  If the response contains tool calls, use tool_calls=[...]
+        # format rather than raw content — the Qwen3.5 template renders them differently
+        # (adds newlines around parameter values), so using content=raw_xml produces a
+        # different token sequence and breaks the cache prefix match.
+        parsed_calls = parse_tool_calls(assistant_text)
+        if parsed_calls:
+            asst_history_msg = {"role": "assistant", "content": None, "tool_calls": parsed_calls}
+        else:
+            asst_history_msg = {"role": "assistant", "content": assistant_text}
+        history_messages = list(request.messages) + [asst_history_msg]
         try:
             # Append two dummy user variants so the template treats the assistant as a
             # history turn (loop.index0 <= last_query_index) rather than the final turn.
