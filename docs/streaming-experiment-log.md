@@ -850,3 +850,508 @@ Conclusion:
   - `decode K=4`
   - `prefill K=2`
   - `prefetch disabled`
+
+## 2026-03-21: Sliding expert-window study on separate experiment branch
+
+Goal:
+
+- answer a narrower question than end-to-end decode:
+  - if we keep the routed experts from the last `H` tokens resident, how much
+    SSD traffic can we eliminate?
+  - does the realized storage-side gain track the hit ratio, or do smaller miss
+    batches degrade SSD efficiency enough to erase the benefit?
+
+Implementation:
+
+- created branch:
+  - `exp/speculative-prefetch-limits`
+- added lightweight expert-selection tracing in:
+  - `streaming_qwen/streamed_switch.py`
+- added study harness:
+  - `scripts/speculative_cache_study.py`
+- the study:
+  - performs a real decode trace with selected experts recorded per layer
+  - simulates sliding reuse windows `H=1/2/3`
+  - replays only miss sets through the native reader to measure realized
+    storage-side improvement
+
+Artifact:
+
+- `.run/speculative-cache-study-20260321.json`
+
+Prompt used:
+
+- `Explain why SSD streaming can bottleneck MoE inference on a laptop, and mention memory pressure too.`
+
+Decode length:
+
+- `24` generated tokens
+
+Key result:
+
+- the user idea is valid, but only in a bounded sliding-window form
+- a window of previous-token experts can fit in memory
+- the realized benefit depends on routed `K`
+- at low `K`, smaller miss batches can become storage-inefficient enough that
+  traffic reduction does not translate into faster read time
+
+Top-k `2`:
+
+- baseline replay:
+  - `3.296 GiB` read
+  - `0.560 s`
+  - `5.89 GiB/s`
+- `H=1`
+  - hit rate: `22.0%`
+  - average resident: `0.127 GiB`
+  - peak resident: `0.132 GiB`
+  - replay time: `0.892 s`
+  - result: slower than baseline
+- `H=2`
+  - hit rate: `28.7%`
+  - average resident: `0.220 GiB`
+  - peak resident: `0.252 GiB`
+  - replay time: `0.686 s`
+  - result: still slower than baseline
+- `H=3`
+  - hit rate: `33.0%`
+  - average resident: `0.300 GiB`
+  - peak resident: `0.349 GiB`
+  - replay time: `0.634 s`
+  - result: still slightly slower than baseline
+
+Interpretation for `K=2`:
+
+- low-`K` miss batches become too small
+- the SSD/native-reader path loses efficiency
+- storage-pattern effects dominate the traffic reduction
+
+Top-k `4`:
+
+- baseline replay:
+  - `6.592 GiB` read
+  - `1.204 s`
+  - `5.48 GiB/s`
+- `H=1`
+  - hit rate: `25.4%`
+  - average resident: `0.253 GiB`
+  - peak resident: `0.264 GiB`
+  - replay time: `1.291 s`
+  - result: slightly slower than baseline
+- `H=2`
+  - hit rate: `32.7%`
+  - average resident: `0.429 GiB`
+  - peak resident: `0.506 GiB`
+  - replay time: `1.114 s`
+  - result: `7.4%` read-time reduction
+- `H=3`
+  - hit rate: `38.8%`
+  - average resident: `0.579 GiB`
+  - peak resident: `0.712 GiB`
+  - replay time: `1.067 s`
+  - result: `11.3%` read-time reduction
+
+Interpretation for `K=4`:
+
+- the plan starts paying off only once the reuse window is larger than one
+  token
+- `H=2` and `H=3` look plausible on this machine from a memory perspective
+- expected end-to-end decode gain will still be smaller than the read-time gain
+  because expert compute and conversion remain
+
+Top-k `8`:
+
+- baseline replay:
+  - `13.184 GiB` read
+  - `2.732 s`
+  - `4.83 GiB/s`
+- `H=1`
+  - hit rate: `31.5%`
+  - average resident: `0.506 GiB`
+  - peak resident: `0.527 GiB`
+  - replay time: `2.050 s`
+  - result: `25.0%` read-time reduction
+- `H=2`
+  - hit rate: `41.3%`
+  - average resident: `0.827 GiB`
+  - peak resident: `0.995 GiB`
+  - replay time: `1.909 s`
+  - result: `30.1%` read-time reduction
+- `H=3`
+  - hit rate: `47.2%`
+  - average resident: `1.086 GiB`
+  - peak resident: `1.287 GiB`
+  - replay time: `1.757 s`
+  - result: `35.7%` read-time reduction
+
+Interpretation for `K=8`:
+
+- the same idea becomes clearly beneficial because each layer read stays large
+  enough for the storage path to remain efficient
+- this is the cleanest evidence that the limiting factor is a combination of:
+  - hit ratio
+  - and miss-batch SSD efficiency
+- not hit ratio alone
+
+Conclusion:
+
+- the right abstraction is a bounded sliding expert working set, not an
+  unbounded expert cache
+- the proposed reuse plan makes sense
+- whether it helps depends strongly on `K`
+- for `K=4`, a two- or three-token window is the first point where storage-side
+  gains become real
+- for `K=2`, the idea is mostly defeated by smaller-miss read inefficiency
+- for `K=8`, the idea is clearly valuable even before full end-to-end integration
+
+## 2026-03-21: Integrated exact rolling expert window in the server/runtime
+
+Goal:
+
+- move from the offline study into the real runtime
+- integrate an exact rolling expert window into decode
+- expose the policy in the server so later branches can test different
+  strategies and window sizes
+- validate whether the observed storage-side gain produces a comparable
+  end-to-end tokens-per-second gain
+
+Implementation:
+
+- added exact per-layer rolling expert reuse to:
+  - `streaming_qwen/streamed_switch.py`
+- added runtime control hooks in:
+  - `streaming_qwen/runtime.py`
+- added server/session control for decode-only activation in:
+  - `streaming_qwen/server/runtime_adapter.py`
+  - `streaming_qwen/server/http.py`
+- added server flags and wrapper defaults in:
+  - `scripts/streamed-qwen-server.sh`
+
+Design:
+
+- cache strategy:
+  - `window_exact`
+- cache key:
+  - exact `(layer, expert)` reuse
+- retention:
+  - previous `H` decode tokens only
+- decode behavior:
+  - hits are served from the rolling in-memory expert window
+  - misses are read from SSD and then inserted into the window
+- prefill behavior:
+  - window cache disabled
+- request lifecycle:
+  - window cache reset at the start and end of each request
+
+Benchmark:
+
+- server config baseline:
+  - `routed_top_k=4`
+  - `prefill_top_k=2`
+  - `expert_cache_strategy=none`
+  - `expert_window_tokens=0`
+- server config candidate:
+  - `routed_top_k=4`
+  - `prefill_top_k=2`
+  - `expert_cache_strategy=window_exact`
+  - `expert_window_tokens=2`
+- prompt:
+  - `Output the word hello exactly 160 times separated by spaces, and nothing else.`
+- request:
+  - `max_tokens=256`
+  - `temperature=0.0`
+
+Artifacts:
+
+- baseline:
+  - `.run/window-cache-baseline-k4.json`
+- integrated `H=2` cache:
+  - `.run/window-cache-h2-k4.json`
+
+Results:
+
+- baseline:
+  - `256` completion tokens in `31.494 s`
+  - `8.129 tok/s`
+- `window_exact`, `H=2`:
+  - `256` completion tokens in `29.270 s`
+  - `8.746 tok/s`
+
+Observed gain:
+
+- end-to-end completion throughput improved by about `7.6%`
+- elapsed wall time dropped by about `2.224 s`
+
+Interpretation:
+
+- the integrated runtime does benefit from the rolling expert window
+- however, the ~`20%` storage-side gain from the offline `K=4, H=2` steady-state
+  study does not translate directly into ~`20%` more tok/s
+- the remaining gap is expected because end-to-end decode still includes:
+  - routed-expert byte-to-MLX conversion
+  - expert `gather_qmm` compute
+  - server/request overhead
+
+Conclusion:
+
+- this exact rolling `H=2` expert window is a valid improvement and should stay
+  as the current `K=4` decode baseline
+- it is not enough by itself to deliver a full `20%` throughput gain
+- the next gains will need to come from reducing conversion cost or moving more
+  of the routed-expert path into a lower-overhead native/Metal execution path
+
+Update after separating cold-start from steady-state:
+
+- the earlier server-level HTTP aggregate was misleading
+- a direct decode-only benchmark with per-token timings shows the integrated
+  `window_exact, H=2` path is actually slower even after skipping the first
+  `2-4` generated tokens
+
+Artifacts:
+
+- direct baseline:
+  - `.run/decode-window-baseline-direct.json`
+- direct `H=2`:
+  - `.run/decode-window-h2-direct.json`
+
+Corrected direct results:
+
+- baseline (`K=4`, `prefill K=2`, no expert window)
+  - all tokens: `6.048 tok/s`
+  - skip first `2`: `6.102 tok/s`
+  - skip first `3`: `6.103 tok/s`
+  - skip first `4`: `6.106 tok/s`
+  - SSD bytes: `72.76 GB`
+  - SSD read time: `15.85 s`
+  - effective read throughput: `4.274 GiB/s`
+- integrated `window_exact`, `H=2`
+  - all tokens: `4.799 tok/s`
+  - skip first `2`: `4.850 tok/s`
+  - skip first `3`: `4.853 tok/s`
+  - skip first `4`: `4.854 tok/s`
+  - SSD bytes: `46.71 GB`
+  - SSD read time: `16.55 s`
+  - effective read throughput: `2.629 GiB/s`
+
+Interpretation:
+
+- the slowdown is not a cold-start artifact
+- even in steady state, the current runtime implementation loses
+- it does reduce bytes read from SSD, but it makes the remaining read pattern
+  too inefficient and still pays the full conversion cost
+- the exact rolling-window cache is therefore not yet a winning runtime design
+  in its current form
+
+Rerun confirmation on the same branch, one-at-a-time:
+
+- direct baseline rerun:
+  - `.run/decode-window-baseline-direct-rerun.json`
+  - all tokens: `5.114 tok/s`
+  - skip first `2`: `5.151 tok/s`
+  - skip first `3`: `5.153 tok/s`
+  - SSD bytes: `72.76 GB`
+  - SSD read time: `21.06 s`
+  - effective read throughput: `3.218 GiB/s`
+- direct `H=2` rerun:
+  - `.run/decode-window-h2-direct-rerun.json`
+  - all tokens: `4.360 tok/s`
+  - skip first `2`: `4.399 tok/s`
+  - skip first `3`: `4.398 tok/s`
+  - SSD bytes: `46.71 GB`
+  - SSD read time: `19.77 s`
+  - effective read throughput: `2.200 GiB/s`
+
+Conclusion after rerun:
+
+- the A/B result is reproducible even with thermal variation
+- the rolling `H=2` cache saves bytes but still loses end-to-end decode throughput
+- the most likely cause is the current hit path itself:
+  - cached experts are stored as per-expert Python byte blobs
+  - the baseline native path converts one contiguous native-read blob per component
+  - the windowed path rebuilds component batches from many smaller expert blobs
+  - remaining SSD misses also become smaller and less efficient
+
+Memory debugging update:
+
+- `mx.get_peak_memory()` stayed flat at about `1.439 GB` because it only reports MLX
+  allocations, not the Python-side rolling expert window
+- OS-level memory and new runtime counters show the window cache is real
+- short direct decode run, `K=4`, `prefill K=2`, `max_tokens=64`:
+  - baseline:
+    - `.run/decode-window-baseline-rss64-stats.json`
+    - `skip2`: `6.208 tok/s`
+    - `window_cache.peak_gib`: `0.0`
+  - `window_exact`, `H=2`:
+    - `.run/decode-window-h2-rss64-stats.json`
+    - `skip2`: `4.051 tok/s`
+    - `window_cache.current_gib`: `0.489`
+    - `window_cache.peak_gib`: `0.781`
+- separate `/usr/bin/time -l` runs showed only a modest RSS delta despite the window
+  cache because the baseline already allocates large transient expert blobs during
+  decode; the rolling window is not the only significant resident/transient memory
+  user of the process
+
+## 2026-03-21: Three targeted optimizations — measured gains and combined impact
+
+### Context
+
+The `window_exact` rolling expert cache (above) was net-negative: it saved 36% of
+SSD bytes but lost 20–25% of end-to-end decode throughput.  Root-cause analysis
+identified three independent problems that were each responsible for meaningful
+overhead.  Each was addressed separately, benchmarked independently, and then
+measured as a stack.
+
+All numbers below are **decode-only tok/s** (autoregressive generation, skip first 3
+tokens for JIT warmup, SSD stats reset after prefill).  Measurement harness:
+`scripts/verify_changes.py`.  Model: `Qwen3.5-35B-A3B-4bit`, `K=4`, `H=2`.
+
+---
+
+### Optimization 1 — Native `dispatch_apply` batch reads (replace Python ThreadPool)
+
+**Problem.**  `ExpertStore.read_components_batched` spawned a Python
+`ThreadPoolExecutor` with one thread per component (gate, up, down) and called
+`read_component_batch` from each thread.  Each call crossed the Python→C ctypes
+boundary and paid Python GIL/thread scheduling overhead.  There were
+`3 components × 40 layers × N decode tokens` such calls per batch.
+
+**Fix.**  A new C function `read_component_batches` takes a flat list of
+`(component, fd, abs_offset, expert_stride, expert_size)` specs and a list of
+expert indices, then dispatches all `components × experts` reads in a single
+`dispatch_apply` block.  Python makes exactly one ctypes call regardless of how
+many components or experts are involved.
+
+**Files changed:**
+
+- `native/expert_io.c` — added `read_component_batches`
+- `streaming_qwen/native_reader.py` — added ctypes binding
+- `streaming_qwen/expert_store.py` — `read_components_batched` now calls the
+  single-call C path
+
+**Measured result (Test C, microbenchmark, 7.1 MB per call, K=4):**
+
+| Path | Median latency | Throughput |
+|------|---------------:|----------:|
+| Python ThreadPool (old) | 0.4 ms | 19–20 GB/s |
+| Native `dispatch_apply` (new) | 0.1 ms | 50–54 GB/s |
+| **Speedup** | **2.57–2.77×** | **2.6–2.7×** |
+
+**End-to-end effect on the no-cache baseline:**
+This is already baked into all subsequent baselines.  Comparing the previous
+`window_exact` baseline (~6.1 tok/s, K=4) to the new no-cache baseline (13.6–15.7
+tok/s) reflects this change alongside the other fixes made in the same commit
+window.
+
+---
+
+### Optimization 2 — Session-window native cache: LUT + slab alloc + batch copy
+
+**Problem.**  Even though `window_exact` had the right algorithmic idea, its
+Python-side implementation paid three compounding costs per layer-call:
+
+1. **O(K×H) expert lookup** — `_lookup_expert_locked` walked `reversed(session.windows)` for each of K=4 experts; at H=2 that is 8 Python iterations per layer-call × 40 layers × 64 tokens ≈ 20,480 Python dict iterations per batch.
+2. **3 separate `malloc` calls per layer** — each layer-call called `alloc_buffer` (ctypes `malloc`) once per component, crossing the ctypes boundary 3 times; 3 × 40 × 64 = 7,680 ctypes alloc+free pairs per decode batch.
+3. **Python loop over `ctypes.memmove`** — cache hits were copied component-by-component in a Python loop; at 56% hit rate on K=4 (~2.25 hits/layer) this was ~6.75 memmove calls per layer × 40 layers × 64 tokens ≈ 17,280 ctypes calls per batch.
+
+**Fixes:**
+
+- **O(1) LUT** — `SessionState` now holds `expert_lut: dict[tuple[int,int], tuple[LayerWindow,int]]`; lookup is a single `dict.get` instead of a reverse scan.  Updated on insert and on eviction with an identity guard.
+- **Composite slab** — one `posix_memalign(total, 64)` call allocates all components in a single contiguous buffer.  `alloc_slab` / `free_slab` exported from `native/expert_mem.c`.  Python sees a `NativeSlab` object with per-component pointer arithmetic; ctypes boundary crossed once per layer-call instead of once per component.
+- **`copy_experts_multi`** — new C function in `native/expert_mem.c` takes arrays of source/destination pointers, expert sizes, and slot indices; dispatches all `components × hits` copies in one `dispatch_apply` block.  Hit path in `load_components_for_layer` makes at most one C call regardless of how many components or experts are cached.
+
+**Files changed:**
+
+- `native/expert_mem.c` — `alloc_slab`, `free_slab`, `copy_experts_multi`
+- `streaming_qwen/native_reader.py` — `NativeSlab`, ctypes bindings for all three
+- `streaming_qwen/session_window_cache.py` — `SessionState.expert_lut`, slab-based `LayerWindow`, rewritten `load_components_for_layer`
+
+**C/Python boundary contract per layer-call (after):**
+
+| Call | When | Purpose |
+|------|------|---------|
+| `alloc_slab(total, 64)` | always | allocate output composite slab |
+| `copy_experts_multi(...)` | if any hits | copy all hit experts × all components |
+| `read_component_batches_into_slots(...)` | if any misses | read all miss experts × all components |
+
+Down from ~11 ctypes calls per layer-call to at most 3.
+
+**Measured result (Test A, end-to-end decode, K=4, H=2):**
+
+| Path | tok/s | SSD read | Hit rate |
+|------|------:|---------:|--------:|
+| No cache | 13.6 | 18.4 GB | — |
+| Session-window H=2 | 15.9 | 6.1 GB | 56.6% |
+| **Delta** | **+17.4%** | **−67%** | |
+
+Compared to the initial `window_exact` cache (which was −20% to −25%), this
+represents a ~40–45 percentage-point turnaround from the same algorithmic idea once
+the Python/C boundary costs were eliminated.
+
+---
+
+### Optimization 3 — Fused gate+up projection
+
+**Problem.**  `_compute_expert_output` called `mx.gather_qmm` separately for
+`gate_proj` and `up_proj` before combining them with `swiglu`.  These are two
+independent linear projections on the same input that could be expressed as a
+single operation.
+
+**Fix.**  `streaming_qwen/fused_expert.py` provides `compute_expert_output_fused`
+which calls `fused_gate_up_swiglu`: one function that performs both gather_qmm
+calls and the swiglu activation before handing off to the down projection.
+`StreamedSwitchGLU` exposes `fused_gate_up` and `compile_fused_gate_up` flags; the
+server passes `--fused-gate-up` through at startup.
+
+**Note on `mx.compile`.** An attempt to compile `fused_gate_up_swiglu` with
+`mx.compile(shapeless=True)` crashed at runtime with:
+`ValueError: [Primitive::output_shapes] GatherQMM cannot infer output shapes`.
+`gather_qmm` output shapes depend on the runtime values of `rhs_indices`, which the
+compiler cannot know statically.  The compiled path is permanently disabled;
+`use_compiled=False` is the default and the parameter is kept only for API
+compatibility.
+
+**Files changed:**
+
+- `streaming_qwen/fused_expert.py` — `fused_gate_up_swiglu`, `compute_expert_output_fused`
+- `streaming_qwen/streamed_switch.py` — `fused_gate_up` / `compile_fused_gate_up` wiring
+- `streaming_qwen/pipelined_moe.py`, `prefetch_switch.py` — same wiring
+
+**Measured result (Test B, end-to-end decode, K=4, no cache):**
+
+| Path | tok/s |
+|------|------:|
+| Separate gate+up (baseline) | 13.1–15.2 |
+| Fused gate+up | 15.0–15.6 |
+| **Delta** | **+2.8–14.8%** |
+
+The range reflects run-to-run variance; the optimizations are not compute-bound
+enough for the fused path to dominate.  Typical observed gain: ~+14% in the same
+run, ~+3% across runs separated by other tests (OS page-cache effects).
+
+---
+
+### Combined gain (Test D, isolated cold run)
+
+Running both fused gate+up and session-window cache H=2 together, with a cold SSD
+(Test D run in isolation, no earlier tests warming the page cache):
+
+| Path | tok/s | SSD read | Hit rate |
+|------|------:|---------:|--------:|
+| Baseline (separate, no cache) | 13.747 | 18.4 GB | — |
+| Fused + cache H=2 | 17.137 | 6.1 GB | 56.6% |
+| **Combined delta** | **+24.7%** | **−67%** | |
+
+The combined gain (+24.7%) is less than the product of the independent gains
+(+17.4% × +14.8% ≈ +35%) because both optimizations reduce overlapping bottlenecks.
+Once the cache eliminates 67% of SSD reads, the I/O bottleneck shrinks and the
+relative weight of compute increases — but compute savings from the fused path are
+smaller in absolute terms than the I/O savings.
+
+**Summary table:**
+
+| Optimization | Mechanism | Isolated gain | In combined stack |
+|---|---|---:|---|
+| Native `dispatch_apply` reads | Single C call replaces Python ThreadPool | 2.6–2.8× read latency | Already in all baselines |
+| Session-window cache H=2 | O(1) LUT + slab alloc + batch C copy | +17.4% tok/s | ✓ |
+| Fused gate+up | Single function for gate+up+swiglu | +3–15% tok/s | ✓ |
+| **All three stacked** | | | **+24.7% tok/s, −67% SSD** |
