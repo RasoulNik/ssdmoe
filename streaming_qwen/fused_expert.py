@@ -63,8 +63,9 @@ def fused_gate_up_swiglu(
     return swiglu(x_gate, x_up)
 
 
-# Create compiled version
-_compiled_fused_gate_up_swiglu = mx.compile(fused_gate_up_swiglu, shapeless=True)
+# NOTE: mx.compile(shapeless=True) cannot be used with gather_qmm because
+# GatherQMM output shapes depend on the runtime values of rhs_indices, which
+# the compiler cannot infer statically. Compiled path is disabled.
 
 
 def compute_expert_output_fused(
@@ -74,7 +75,7 @@ def compute_expert_output_fused(
     group_size: int = 64,
     bits: int = 4,
     mode: str = "affine",
-    use_compiled: bool = True,
+    use_compiled: bool = False,  # always ignored; kept for API compatibility
 ) -> mx.array:
     """Compute expert output with fused gate+up+swiglu.
 
@@ -88,34 +89,19 @@ def compute_expert_output_fused(
 
     # Fused gate+up+swiglu
     t1 = time.perf_counter()
-    if use_compiled:
-        activated = _compiled_fused_gate_up_swiglu(
-            x,
-            tensors["gate_proj.weight"],
-            tensors["gate_proj.scales"],
-            tensors["gate_proj.biases"],
-            tensors["up_proj.weight"],
-            tensors["up_proj.scales"],
-            tensors["up_proj.biases"],
-            indices,
-            group_size,
-            bits,
-            mode,
-        )
-    else:
-        activated = fused_gate_up_swiglu(
-            x,
-            tensors["gate_proj.weight"],
-            tensors["gate_proj.scales"],
-            tensors["gate_proj.biases"],
-            tensors["up_proj.weight"],
-            tensors["up_proj.scales"],
-            tensors["up_proj.biases"],
-            indices,
-            group_size,
-            bits,
-            mode,
-        )
+    activated = fused_gate_up_swiglu(
+        x,
+        tensors["gate_proj.weight"],
+        tensors["gate_proj.scales"],
+        tensors["gate_proj.biases"],
+        tensors["up_proj.weight"],
+        tensors["up_proj.scales"],
+        tensors["up_proj.biases"],
+        indices,
+        group_size,
+        bits,
+        mode,
+    )
     if PROFILE_STREAMED:
         mx.eval(activated)
     # Track combined time for gate+up+swiglu
