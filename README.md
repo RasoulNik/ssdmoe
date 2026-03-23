@@ -117,7 +117,31 @@ and only prefills the new user message and tool results.
 - 16 GB+ unified memory (runs on 16 GB; more headroom is better)
 - Python 3.10+, [Poetry](https://python-poetry.org/)
 - Xcode command-line tools (`xcode-select --install`)
-- `mlx-community/Qwen3.5-35B-A3B-4bit` model checkpoint (~18.5 GB on disk)
+- The **`mlx-community/Qwen3.5-35B-A3B-4bit`** model checkpoint (~19 GB on disk) — see [Model Download](#model-download) below
+
+## Model Download
+
+This server is built specifically for:
+
+| | |
+|---|---|
+| **HuggingFace repo** | [`mlx-community/Qwen3.5-35B-A3B-4bit`](https://huggingface.co/mlx-community/Qwen3.5-35B-A3B-4bit) |
+| **Snapshot hash** | `1e20fd8d42056f870933bf98ca6211024744f7ec` |
+| **Local path after download** | `~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec/` |
+| **Size on disk** | ~19 GB |
+
+Download with `huggingface-cli`:
+
+```bash
+pip install huggingface-hub
+huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit
+```
+
+This places the files at the path shown above. The expert index and server scripts
+default to this exact path so no extra configuration is needed after download.
+
+> The server reads expert weights **directly from the original safetensors shards** —
+> no conversion, no second copy. The ~19 GB on disk is the only copy needed.
 
 ## Quick Start
 
@@ -131,8 +155,9 @@ poetry install
 make -C native && make -C native install
 
 # 3. Build the expert byte-offset index (one-time, ~30 s)
+#    Uses the default model path — no argument needed if you used huggingface-cli above
 poetry run python tools/build_qwen_moe_index.py \
-  --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/<hash> \
+  --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec \
   --output .run/qwen35b-expert-index.json
 
 # 4. Start the server
