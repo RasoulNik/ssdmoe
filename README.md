@@ -10,20 +10,45 @@ via on-demand expert streaming — no full model load into RAM, no second copy o
 | Decode throughput (K=4, fresh process) | **7–8 tok/s** |
 | Decode throughput (K=4, warm server) | **10–12 tok/s** |
 | Prefill speed — cold start (bench) | ~75 tok/s |
-| Prefill speed — server (with step overhead) | ~52 tok/s |
+| Prefill speed — server (step=4096) | ~52 tok/s |
 | Multi-turn KV cache hit rate | **97–98%+** |
 | Active memory (server runtime) | ~1 GB |
-| Peak memory (during prefill) | ~2.5 GB |
+| Peak memory (during 1.2k-token prefill) | ~2.5 GB |
+| Peak memory (during 10k-token prefill) | ~3.9 GB |
 | Full model size on disk | ~19 GB |
 
 Platform: Apple M4 MacBook Air, 16 GB unified memory, internal SSD (~5.6 GB/s sustained read).
 
 > Decode throughput scales with OS page cache warmth. A freshly started process reads
-> expert shards from SSD on every token (~7–8 tok/s). After a long-running session, the
+> expert shards from SSD on every token (~7–8 tok/s). After a long-running session the
 > OS has hot-cached frequently used expert shards in RAM, reaching 10–12 tok/s.
 > The server step overhead in prefill (one `mx.clear_cache()` call per 4096-token chunk)
-> costs ~30% vs the bench script. Chunk size is tunable via `PREFILL_STEP_SIZE`; 4096 is
-> safe on this machine (peak Metal memory 5.3 GB vs 16 GB available).
+> costs ~30% vs the bench script. `PREFILL_STEP_SIZE=4096` is safe on this machine
+> (peak Metal memory 5.3 GB for a single 4096-token chunk vs 16 GB available).
+
+### Long-context prefill and KV cache cost
+
+Measured with a 10,014-token prompt (README + all docs concatenated), K=4:
+
+| | Value |
+|---|---|
+| Prefill time (bench) | **143 s (2.4 min)** |
+| Prefill time (server, step=4096) | **~204 s (3.4 min)** |
+| Peak Metal memory during prefill | **3.9 GB** |
+| KV cache size on disk | **~265 MB** |
+
+KV cache storage scales at **~27 KB per token**:
+
+| Context | Disk KV cache |
+|---------|--------------|
+| 1,000 tokens | ~27 MB |
+| 4,500 tokens | ~120 MB |
+| 10,000 tokens | ~265 MB |
+| 32,000 tokens | ~860 MB |
+
+The 3.4-minute cold prefill is a one-time cost per unique conversation prefix.
+With 97%+ cache hits, every subsequent turn only prefills the new user message
+(typically 50–200 tokens, ~1–4 s) instead of re-running the full context.
 
 ## Architecture
 
