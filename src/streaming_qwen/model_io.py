@@ -12,11 +12,23 @@ import mlx.core as mx
 import numpy as np
 
 
-EXPERT_RE = re.compile(
-    r"^language_model\.model\.layers\.(?P<layer>\d+)\.mlp\.switch_mlp\."
+# Qwen3 MoE: language_model.model.layers.{n}.mlp.switch_mlp.{gate_proj,up_proj,down_proj}.*
+QWEN_EXPERT_RE = re.compile(
+    r"^(language_model\.)?model\.layers\.(?P<layer>\d+)\.mlp\.switch_mlp\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\."
     r"(?P<kind>weight|scales|biases)$"
 )
+# Nemotron-H: backbone.layers.{n}.mixer.switch_mlp.{fc1,fc2}.*
+NEMOTRON_EXPERT_RE = re.compile(
+    r"^backbone\.layers\.(?P<layer>\d+)\.mixer\.switch_mlp\."
+    r"(?P<proj>fc1|fc2)\."
+    r"(?P<kind>weight|scales|biases)$"
+)
+# Combined — checked by classify_tensor
+EXPERT_RES = [QWEN_EXPERT_RE, NEMOTRON_EXPERT_RE]
+# Legacy alias so external scripts that import EXPERT_RE still work
+EXPERT_RE = QWEN_EXPERT_RE
+
 VISION_RE = re.compile(r"^(vision_tower|model\.visual|visual)")
 DTYPE_TO_NP = {
     "F32": np.float32,
@@ -48,7 +60,7 @@ def read_safetensors_header(path: Path) -> tuple[dict, int]:
 
 
 def classify_tensor(name: str) -> str:
-    if EXPERT_RE.match(name):
+    if any(r.match(name) for r in EXPERT_RES):
         return "expert"
     if VISION_RE.match(name):
         return "vision"
@@ -72,7 +84,7 @@ def list_expert_aux_tensors(model_path: Path) -> list[str]:
 def group_expert_tensor_map(tensors: dict[str, mx.array]) -> dict[int, dict[str, mx.array]]:
     grouped: dict[int, dict[str, mx.array]] = defaultdict(dict)
     for name, tensor in tensors.items():
-        match = EXPERT_RE.match(name)
+        match = next((r.match(name) for r in EXPERT_RES if r.match(name)), None)
         if match is None:
             continue
         layer_idx = int(match.group("layer"))

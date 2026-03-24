@@ -82,9 +82,54 @@ def _compute_expert_output(
     group_size: int,
     bits: int,
     mode: str,
+    activation: str = "swiglu",
     fused_gate_up: bool = False,
     compile_fused_gate_up: bool = False,
 ) -> mx.array:
+    if activation == "relu2":
+        # Nemotron: fc1 → relu² → fc2  (no gate projection)
+        x = mx.expand_dims(x, (-2, -3))
+        t1 = time.perf_counter()
+        x_up = mx.gather_qmm(
+            x,
+            tensors["fc1.weight"],
+            tensors["fc1.scales"],
+            tensors["fc1.biases"],
+            rhs_indices=local_indices,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            sorted_indices=False,
+        )
+        if PROFILE_STREAMED:
+            mx.eval(x_up)
+        STREAM_STATS["qmm_up_seconds"] += time.perf_counter() - t1
+
+        t3 = time.perf_counter()
+        activated = nn.relu(x_up) ** 2
+        if PROFILE_STREAMED:
+            mx.eval(activated)
+        STREAM_STATS["swiglu_seconds"] += time.perf_counter() - t3
+
+        t4 = time.perf_counter()
+        x_down = mx.gather_qmm(
+            activated,
+            tensors["fc2.weight"],
+            tensors["fc2.scales"],
+            tensors["fc2.biases"],
+            rhs_indices=local_indices,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+            sorted_indices=False,
+        )
+        if PROFILE_STREAMED:
+            mx.eval(x_down)
+        STREAM_STATS["qmm_down_seconds"] += time.perf_counter() - t4
+        return x_down.squeeze(-2)
+
     if fused_gate_up:
         from .fused_expert import compute_expert_output_fused
 
@@ -172,6 +217,7 @@ class StreamedSwitchGLU(nn.Module):
         fused_gate_up: bool = False,
         compile_fused_gate_up: bool = False,
         session_cache=None,
+        activation: str = "swiglu",
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -183,6 +229,7 @@ class StreamedSwitchGLU(nn.Module):
         self.fused_gate_up = fused_gate_up
         self.compile_fused_gate_up = compile_fused_gate_up
         self.session_cache = session_cache  # SessionWindowNativeCache | None
+        self.activation = activation  # "swiglu" | "relu2"
         self._cache: OrderedDict[tuple[int, int], tuple[dict[str, mx.array], int]] = OrderedDict()
         self._cache_bytes = 0
         # Pre-compute per-layer constants so __call__ doesn't rebuild them every token
@@ -350,6 +397,7 @@ class StreamedSwitchGLU(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
+            activation=self.activation,
             fused_gate_up=self.fused_gate_up,
             compile_fused_gate_up=self.compile_fused_gate_up,
         )
