@@ -3,26 +3,25 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUN_DIR="$ROOT_DIR/.run"
-PID_FILE="$RUN_DIR/streamed-qwen.pid"
-PORT_FILE="$RUN_DIR/streamed-qwen.port"
-HOST_FILE="$RUN_DIR/streamed-qwen.host"
-LOG_FILE="$RUN_DIR/streamed-qwen.log"
-SESSION_NAME="streamed-qwen-server"
+PID_FILE="$RUN_DIR/nemotron.pid"
+PORT_FILE="$RUN_DIR/nemotron.port"
+HOST_FILE="$RUN_DIR/nemotron.host"
+LOG_FILE="$RUN_DIR/nemotron.log"
+SESSION_NAME="nemotron-server"
 LOCK_FILE="$RUN_DIR/moe-server.lock"
 
-MODEL_PATH="${MODEL_PATH:-$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec}"
-INDEX_PATH="${INDEX_PATH:-$ROOT_DIR/.run/qwen35b-expert-index.json}"
+MODEL_PATH="${MODEL_PATH:-$HOME/.cache/huggingface/hub/models--mlx-community--NVIDIA-Nemotron-3-Nano-30B-A3B-4bit/snapshots/832f602eba5d22436c258c1462bdedc5afddb42b}"
+INDEX_PATH="${INDEX_PATH:-$ROOT_DIR/.run/nemotron30b-expert-index.json}"
 NATIVE_READER_PATH="${NATIVE_READER_PATH:-$ROOT_DIR/.run/libexpert_reader.dylib}"
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-9002}"
-ROUTED_TOP_K="${ROUTED_TOP_K:-4}"
+PORT="${PORT:-9003}"
+ROUTED_TOP_K="${ROUTED_TOP_K:-6}"
 PREFILL_TOP_K="${PREFILL_TOP_K:-$ROUTED_TOP_K}"
 COMPONENT_WORKERS="${COMPONENT_WORKERS:-3}"
 MAX_TOKENS="${MAX_TOKENS:-16384}"
 TEMP="${TEMP:-0.7}"
 TOP_P="${TOP_P:-0.95}"
 WARMUP_TOKENS="${WARMUP_TOKENS:-8}"
-ENABLE_THINKING="${ENABLE_THINKING:-false}"
 PREFILL_STEP_SIZE="${PREFILL_STEP_SIZE:-4096}"
 PROMPT_CACHE_SIZE="${PROMPT_CACHE_SIZE:-8}"
 PROMPT_CACHE_BYTES="${PROMPT_CACHE_BYTES:-1G}"
@@ -31,7 +30,7 @@ ENABLE_PREFETCH="${ENABLE_PREFETCH:-false}"
 
 usage() {
   cat <<EOF
-Usage: ./scripts/streamed-qwen-server.sh <start|stop|status|restart>
+Usage: ./scripts/nemotron-server.sh <start|stop|status|restart>
 
 Environment overrides:
   MODEL_PATH=$MODEL_PATH
@@ -46,7 +45,6 @@ Environment overrides:
   TEMP=$TEMP
   TOP_P=$TOP_P
   WARMUP_TOKENS=$WARMUP_TOKENS
-  ENABLE_THINKING=$ENABLE_THINKING
   PREFILL_STEP_SIZE=$PREFILL_STEP_SIZE
   PROMPT_CACHE_SIZE=$PROMPT_CACHE_SIZE
   PROMPT_CACHE_BYTES=$PROMPT_CACHE_BYTES
@@ -85,14 +83,6 @@ validate_paths() {
   [[ -f "$NATIVE_READER_PATH" ]] || { echo "missing native reader dylib: $NATIVE_READER_PATH"; exit 1; }
 }
 
-thinking_flag() {
-  if [[ "$ENABLE_THINKING" == "false" ]]; then
-    echo "--disable-thinking"
-  else
-    echo "--enable-thinking"
-  fi
-}
-
 start_server() {
   mkdir -p "$RUN_DIR"
   validate_paths
@@ -108,7 +98,7 @@ start_server() {
   if is_running; then
     local pid
     pid="$(server_pid)"
-    echo "streamed Qwen server is already running"
+    echo "Nemotron server is already running"
     echo "pid: $pid"
     echo "endpoint: http://$(server_host):$(server_port)/v1"
     echo "log: $LOG_FILE"
@@ -123,8 +113,6 @@ start_server() {
   rm -f "$PID_FILE" "$PORT_FILE" "$HOST_FILE"
   screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
 
-  local thinking
-  thinking="$(thinking_flag)"
   local prefetch
   if [[ "$ENABLE_PREFETCH" == "true" ]]; then
     prefetch="--enable-prefetch"
@@ -152,8 +140,7 @@ start_server() {
       --prompt-cache-size '$PROMPT_CACHE_SIZE' \
       --prompt-cache-bytes '$PROMPT_CACHE_BYTES' \
       --warmup-tokens '$WARMUP_TOKENS' \
-      $prefetch \
-      $thinking >>'$LOG_FILE' 2>&1
+      $prefetch >>'$LOG_FILE' 2>&1
   "
 
   local pid=""
@@ -171,8 +158,8 @@ start_server() {
     echo "$pid" > "$PID_FILE"
     echo "$PORT" > "$PORT_FILE"
     echo "$HOST" > "$HOST_FILE"
-    echo "qwen (pid=$pid port=$PORT)" > "$LOCK_FILE"
-    echo "streamed Qwen server started"
+    echo "nemotron (pid=$pid port=$PORT)" > "$LOCK_FILE"
+    echo "Nemotron server started"
     echo "pid: $pid"
     echo "endpoint: http://$HOST:$PORT/v1"
     echo "routed_top_k: $ROUTED_TOP_K"
@@ -182,7 +169,7 @@ start_server() {
     echo "prompt_cache_bytes: $PROMPT_CACHE_BYTES"
     echo "log: $LOG_FILE"
   else
-    echo "streamed Qwen server failed to start"
+    echo "Nemotron server failed to start"
     echo "check log: $LOG_FILE"
     screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
     rm -f "$PID_FILE" "$PORT_FILE" "$HOST_FILE"
@@ -192,7 +179,7 @@ start_server() {
 
 stop_server() {
   if ! [[ -f "$PID_FILE" ]]; then
-    echo "streamed Qwen server is not running"
+    echo "Nemotron server is not running"
     screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
     return 0
   fi
@@ -202,10 +189,10 @@ stop_server() {
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid"
     screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
-    echo "stopped streamed Qwen server"
+    echo "stopped Nemotron server"
     echo "pid: $pid"
   else
-    echo "streamed Qwen server is not running"
+    echo "Nemotron server is not running"
     echo "removed stale PID file"
     screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
   fi
@@ -215,12 +202,12 @@ stop_server() {
 
 status_server() {
   if is_running; then
-    echo "streamed Qwen server is running"
+    echo "Nemotron server is running"
     echo "pid: $(server_pid)"
     echo "endpoint: http://$(server_host):$(server_port)/v1"
     echo "log: $LOG_FILE"
   else
-    echo "streamed Qwen server is not running"
+    echo "Nemotron server is not running"
     [[ -f "$PID_FILE" ]] && echo "stale PID file: $PID_FILE"
     return 1
   fi

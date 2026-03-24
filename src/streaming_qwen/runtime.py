@@ -18,17 +18,37 @@ from .session_window_cache import SessionWindowNativeCache
 from .streamed_switch import StreamedSwitchGLU
 
 
+def _get_moe_module(layer):
+    """Return (moe_module, set_top_k) for a layer, or (None, None) if not a MoE layer.
+
+    Handles two layouts:
+      Qwen3:    layer.mlp.switch_mlp   / top_k on mlp
+      Nemotron: layer.mixer.switch_mlp / top_k on mixer.gate
+    """
+    mlp = getattr(layer, "mlp", None)
+    if mlp is not None and hasattr(mlp, "switch_mlp"):
+        return mlp, lambda k: setattr(mlp, "top_k", k)
+    mixer = getattr(layer, "mixer", None)
+    if mixer is not None and hasattr(mixer, "switch_mlp"):
+        gate = getattr(mixer, "gate", None)
+        setter = (lambda k: setattr(gate, "top_k", k)) if gate is not None else (lambda k: None)
+        return mixer, setter
+    return None, None
+
+
 def iter_moe_layers(model):
     text_model = getattr(getattr(model, "language_model", model), "model", model)
     for layer in text_model.layers:
-        mlp = getattr(layer, "mlp", None)
-        if mlp is not None and hasattr(mlp, "switch_mlp") and hasattr(mlp, "top_k"):
+        moe_module, _ = _get_moe_module(layer)
+        if moe_module is not None:
             yield layer
 
 
 def set_routed_top_k(model, top_k: int) -> None:
     for layer in iter_moe_layers(model):
-        layer.mlp.top_k = top_k
+        _, set_top_k = _get_moe_module(layer)
+        if set_top_k is not None:
+            set_top_k(top_k)
 
 
 def _patch_streamed_switches(
@@ -40,17 +60,27 @@ def _patch_streamed_switches(
     fused_gate_up: bool = False,
     compile_fused_gate_up: bool = False,
     session_cache: SessionWindowNativeCache | None = None,
+    activation: str = "swiglu",
 ) -> None:
-    layers = list(iter_moe_layers(model))
+    # Use global layer indices so layer_idx matches the expert index keys.
+    # For Qwen all layers are MoE so global_idx==moe_idx, but for hybrid
+    # models (Nemotron) only some layers are MoE — we must use the real
+    # position in text_model.layers (== the index in the safetensors key).
+    text_model = getattr(getattr(model, "language_model", model), "model", model)
+    all_layers = list(text_model.layers)
+    moe_layer_pairs = [
+        (i, layer) for i, layer in enumerate(all_layers)
+        if _get_moe_module(layer)[0] is not None
+    ]
     prefetch_manager = (
-        PrefetchManager(expert_store, num_layers=len(layers)) if use_prefetch else None
+        PrefetchManager(expert_store, num_layers=len(moe_layer_pairs)) if use_prefetch else None
     )
-    for layer_idx, layer in enumerate(layers):
-        mlp = getattr(layer, "mlp", None)
-        if mlp is None or not hasattr(mlp, "switch_mlp"):
+    for layer_idx, layer in moe_layer_pairs:
+        moe_module, _ = _get_moe_module(layer)
+        if moe_module is None:
             continue
         if use_prefetch:
-            mlp.switch_mlp = PrefetchingStreamedSwitchGLU(
+            moe_module.switch_mlp = PrefetchingStreamedSwitchGLU(
                 layer_idx=layer_idx,
                 expert_store=expert_store,
                 prefetch_manager=prefetch_manager,
@@ -61,7 +91,7 @@ def _patch_streamed_switches(
                 compile_fused_gate_up=compile_fused_gate_up,
             )
         else:
-            mlp.switch_mlp = StreamedSwitchGLU(
+            moe_module.switch_mlp = StreamedSwitchGLU(
                 layer_idx=layer_idx,
                 expert_store=expert_store,
                 group_size=quantization.get("group_size", 64),
@@ -71,6 +101,7 @@ def _patch_streamed_switches(
                 fused_gate_up=fused_gate_up,
                 compile_fused_gate_up=compile_fused_gate_up,
                 session_cache=session_cache,
+                activation=activation,
             )
     expert_store.prefetch_manager = prefetch_manager
 
@@ -140,6 +171,10 @@ def build_streamed_model(
             window_tokens=expert_window_tokens,
         )
 
+    # Detect activation from model type: Nemotron uses relu2 (no gate, 2-component experts)
+    model_type = config.get("model_type", "")
+    activation = "relu2" if "nemotron" in model_type.lower() else "swiglu"
+
     if moe_impl != "pipelined":
         _patch_streamed_switches(
             model,
@@ -150,6 +185,7 @@ def build_streamed_model(
             fused_gate_up=fused_gate_up,
             compile_fused_gate_up=compile_fused_gate_up,
             session_cache=session_cache,
+            activation=activation,
         )
     _quantize_resident_modules(model, config, available_weight_names)
 
@@ -183,9 +219,11 @@ def build_streamed_model(
 def _get_session_cache(model) -> SessionWindowNativeCache | None:
     """Return the shared SessionWindowNativeCache from the first MoE layer, or None."""
     for layer in iter_moe_layers(model):
-        switch = getattr(layer.mlp, "switch_mlp", None)
-        if switch is not None:
-            return getattr(switch, "session_cache", None)
+        moe_module, _ = _get_moe_module(layer)
+        if moe_module is not None:
+            switch = getattr(moe_module, "switch_mlp", None)
+            if switch is not None:
+                return getattr(switch, "session_cache", None)
     return None
 
 
@@ -237,7 +275,8 @@ def collect_window_cache_stats(model) -> dict:
     entries = 0
     bytes_used = 0
     for layer in iter_moe_layers(model):
-        switch = getattr(layer.mlp, "switch_mlp", None)
+        moe_module, _ = _get_moe_module(layer)
+        switch = getattr(moe_module, "switch_mlp", None) if moe_module is not None else None
         if switch is not None:
             entries += len(getattr(switch, "_cache", {}))
             bytes_used += getattr(switch, "_cache_bytes", 0)
@@ -252,7 +291,8 @@ def collect_window_cache_stats(model) -> dict:
 def set_window_cache_enabled(model, enabled: bool, *, reset: bool = False) -> None:
     """Enable or disable the in-process LRU tensor cache on all MoE layers."""
     for layer in iter_moe_layers(model):
-        switch = getattr(layer.mlp, "switch_mlp", None)
+        moe_module, _ = _get_moe_module(layer)
+        switch = getattr(moe_module, "switch_mlp", None) if moe_module is not None else None
         if switch is None:
             continue
         if reset and hasattr(switch, "_cache"):

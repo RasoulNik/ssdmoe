@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from collections import deque
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 
 import mlx.core as mx
 from mlx_lm.generate import generate_step
