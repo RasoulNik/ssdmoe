@@ -8,6 +8,7 @@ PORT_FILE="$RUN_DIR/nemotron.port"
 HOST_FILE="$RUN_DIR/nemotron.host"
 LOG_FILE="$RUN_DIR/nemotron.log"
 SESSION_NAME="nemotron-server"
+LOCK_FILE="$RUN_DIR/moe-server.lock"
 
 MODEL_PATH="${MODEL_PATH:-$HOME/.cache/huggingface/hub/models--mlx-community--NVIDIA-Nemotron-3-Nano-30B-A3B-4bit/snapshots/832f602eba5d22436c258c1462bdedc5afddb42b}"
 INDEX_PATH="${INDEX_PATH:-$ROOT_DIR/.run/nemotron30b-expert-index.json}"
@@ -86,6 +87,14 @@ start_server() {
   mkdir -p "$RUN_DIR"
   validate_paths
 
+  if [[ -f "$LOCK_FILE" ]]; then
+    local other
+    other="$(cat "$LOCK_FILE")"
+    echo "another MoE server is already running: $other"
+    echo "stop it first to avoid OOM (only one model fits in memory)"
+    return 1
+  fi
+
   if is_running; then
     local pid
     pid="$(server_pid)"
@@ -149,6 +158,7 @@ start_server() {
     echo "$pid" > "$PID_FILE"
     echo "$PORT" > "$PORT_FILE"
     echo "$HOST" > "$HOST_FILE"
+    echo "nemotron (pid=$pid port=$PORT)" > "$LOCK_FILE"
     echo "Nemotron server started"
     echo "pid: $pid"
     echo "endpoint: http://$HOST:$PORT/v1"
@@ -187,7 +197,7 @@ stop_server() {
     screen -S "$SESSION_NAME" -X quit >/dev/null 2>&1 || true
   fi
 
-  rm -f "$PID_FILE" "$PORT_FILE" "$HOST_FILE"
+  rm -f "$PID_FILE" "$PORT_FILE" "$HOST_FILE" "$LOCK_FILE"
 }
 
 status_server() {

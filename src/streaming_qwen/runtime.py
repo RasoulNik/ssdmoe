@@ -219,9 +219,11 @@ def build_streamed_model(
 def _get_session_cache(model) -> SessionWindowNativeCache | None:
     """Return the shared SessionWindowNativeCache from the first MoE layer, or None."""
     for layer in iter_moe_layers(model):
-        switch = getattr(layer.mlp, "switch_mlp", None)
-        if switch is not None:
-            return getattr(switch, "session_cache", None)
+        moe_module, _ = _get_moe_module(layer)
+        if moe_module is not None:
+            switch = getattr(moe_module, "switch_mlp", None)
+            if switch is not None:
+                return getattr(switch, "session_cache", None)
     return None
 
 
@@ -273,7 +275,8 @@ def collect_window_cache_stats(model) -> dict:
     entries = 0
     bytes_used = 0
     for layer in iter_moe_layers(model):
-        switch = getattr(layer.mlp, "switch_mlp", None)
+        moe_module, _ = _get_moe_module(layer)
+        switch = getattr(moe_module, "switch_mlp", None) if moe_module is not None else None
         if switch is not None:
             entries += len(getattr(switch, "_cache", {}))
             bytes_used += getattr(switch, "_cache_bytes", 0)
@@ -288,7 +291,8 @@ def collect_window_cache_stats(model) -> dict:
 def set_window_cache_enabled(model, enabled: bool, *, reset: bool = False) -> None:
     """Enable or disable the in-process LRU tensor cache on all MoE layers."""
     for layer in iter_moe_layers(model):
-        switch = getattr(layer.mlp, "switch_mlp", None)
+        moe_module, _ = _get_moe_module(layer)
+        switch = getattr(moe_module, "switch_mlp", None) if moe_module is not None else None
         if switch is None:
             continue
         if reset and hasattr(switch, "_cache"):
