@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from streaming_qwen.server import parse_args, run_server
+from streaming_moe.server import parse_args, run_server
 
 
 def main() -> None:

@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from lib.loader import save_json  # noqa: E402
 
-from streaming_qwen.expert_store import ExpertStore  # noqa: E402
+from streaming_moe.expert_store import ExpertStore  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

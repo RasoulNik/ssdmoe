@@ -2,7 +2,7 @@
 
 Usage in any benchmark:
     from lib.loader import ensure_src_path, parse_bytes, save_json
-    ensure_src_path()  # call before importing streaming_qwen
+    ensure_src_path()  # call before importing streaming_moe
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from pathlib import Path
 
 
 def ensure_src_path() -> None:
-    """Add repo src/ to sys.path so streaming_qwen is importable without install."""
+    """Add repo src/ to sys.path so streaming_moe is importable without install."""
     src = str(Path(__file__).resolve().parent.parent.parent / "src")
     if src not in sys.path:
         sys.path.insert(0, src)

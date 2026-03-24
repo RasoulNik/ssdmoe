@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 import mlx.core as mx
 from mlx_lm.generate import stream_generate
 
-from streaming_qwen.runtime import build_streamed_model
-from streaming_qwen.streamed_switch import (
+from streaming_moe.runtime import build_streamed_model
+from streaming_moe.streamed_switch import (
     STREAM_STATS,
     reset_stream_stats,
 )

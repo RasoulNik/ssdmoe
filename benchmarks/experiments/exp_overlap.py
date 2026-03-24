@@ -20,8 +20,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
 import mlx.core as mx
 import numpy as np
 
-from streaming_qwen.expert_store import ExpertStore
-from streaming_qwen.runtime import build_streamed_model
+from streaming_moe.expert_store import ExpertStore
+from streaming_moe.runtime import build_streamed_model
 
 
 def measure_io_gpu_overlap(

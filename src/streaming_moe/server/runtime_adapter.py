@@ -7,7 +7,7 @@ from pathlib import Path
 
 from mlx_lm.generate import stream_generate
 
-from streaming_qwen.runtime import build_streamed_model, set_routed_top_k
+from streaming_moe.runtime import build_streamed_model, set_routed_top_k
 
 from .persistent_cache import PersistentPromptCache
 from .protocol import build_system_fingerprint
@@ -48,7 +48,7 @@ class StreamedModelSession:
             fused_gate_up=args.fused_gate_up,
             compile_fused_gate_up=args.compile_fused_gate_up,
         )
-        self.model_id = args.served_model_id or f"streamed-qwen-k{args.routed_top_k}"
+        self.model_id = args.served_model_id or f"streamed-moe-k{args.routed_top_k}"
         self.system_fingerprint = build_system_fingerprint(
             self.model_id,
             str(self.model_path),

@@ -33,8 +33,8 @@ import mlx.core as mx  # noqa: E402
 from mlx_lm.generate import stream_generate  # noqa: E402
 from mlx_lm.utils import load as load_mlx_model  # noqa: E402
 
-from streaming_qwen.runtime import build_streamed_model  # noqa: E402
-from streaming_qwen.streamed_switch import (  # noqa: E402
+from streaming_moe.runtime import build_streamed_model  # noqa: E402
+from streaming_moe.streamed_switch import (  # noqa: E402
     STREAM_STATS,
     reset_stream_stats,
     set_stream_profiling,

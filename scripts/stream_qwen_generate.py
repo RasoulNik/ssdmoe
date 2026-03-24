@@ -8,7 +8,7 @@ from pathlib import Path
 
 from mlx_lm.generate import generate
 
-from streaming_qwen.runtime import build_streamed_model
+from streaming_moe.runtime import build_streamed_model
 
 
 def parse_args() -> argparse.Namespace:

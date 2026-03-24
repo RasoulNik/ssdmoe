@@ -21,7 +21,7 @@ See [docs/development.md](docs/development.md) for full setup and benchmark inst
 
 ## Conventions
 
-- Pure Python (`src/streaming_qwen/`) — no new external dependencies without discussion
+- Pure Python (`src/streaming_moe/`) — no new external dependencies without discussion
 - Hot-path changes (expert loading, decode loop) require a before/after benchmark run
   using `benchmarks/bench_decode_window_cache.py`
 - Native C (`native/`) — changes must compile with both `make` targets (dispatch + serial)

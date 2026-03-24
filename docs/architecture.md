@@ -11,10 +11,10 @@
 
 | Module | Location | Role |
 |--------|----------|------|
-| `protocol.py` | `src/streaming_qwen/server/` | Request normalisation, capability validation, OpenAI error envelopes, response builders for chat completions and SSE chunks |
-| `runtime_adapter.py` | `src/streaming_qwen/server/` | Model and session lifecycle, model warm-up, in-memory LRU KV cache budget, model ID and system fingerprint |
-| `http.py` | `src/streaming_qwen/server/` | HTTP handler and server bootstrap, request dispatch, non-stream and SSE chat flows, prompt-prefix checkpointing, tool-call emission |
-| `persistent_cache.py` | `src/streaming_qwen/server/` | Disk KV cache: safetensors checkpoints, LRU eviction, deferred flush, end-of-turn checkpoint for multi-turn prefix sharing |
+| `protocol.py` | `src/streaming_moe/server/` | Request normalisation, capability validation, OpenAI error envelopes, response builders for chat completions and SSE chunks |
+| `runtime_adapter.py` | `src/streaming_moe/server/` | Model and session lifecycle, model warm-up, in-memory LRU KV cache budget, model ID and system fingerprint |
+| `http.py` | `src/streaming_moe/server/` | HTTP handler and server bootstrap, request dispatch, non-stream and SSE chat flows, prompt-prefix checkpointing, tool-call emission |
+| `persistent_cache.py` | `src/streaming_moe/server/` | Disk KV cache: safetensors checkpoints, LRU eviction, deferred flush, end-of-turn checkpoint for multi-turn prefix sharing |
 | `streamed_qwen_server.py` | `scripts/` | Thin entrypoint: arg parsing + `run_server()` |
 
 ## KV cache: why two checkpoints per turn

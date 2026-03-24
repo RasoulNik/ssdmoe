@@ -40,8 +40,8 @@ import mlx.core as mx  # noqa: E402
 from mlx_lm.generate import generate_step  # noqa: E402
 from mlx_lm.models.cache import make_prompt_cache  # noqa: E402
 
-from streaming_qwen.prefetch_switch import PrefetchManager  # noqa: E402
-from streaming_qwen.runtime import (  # noqa: E402
+from streaming_moe.prefetch_switch import PrefetchManager  # noqa: E402
+from streaming_moe.runtime import (  # noqa: E402
     begin_session_cache_request,
     build_streamed_model,
     collect_session_cache_stats,
@@ -52,8 +52,8 @@ from streaming_qwen.runtime import (  # noqa: E402
     set_session_cache_phase,
     set_window_cache_enabled,
 )
-from streaming_qwen.server.protocol import prompt_tokens_from_messages  # noqa: E402
-from streaming_qwen.streamed_switch import STREAM_STATS, reset_stream_stats, set_stream_profiling  # noqa: E402
+from streaming_moe.server.protocol import prompt_tokens_from_messages  # noqa: E402
+from streaming_moe.streamed_switch import STREAM_STATS, reset_stream_stats, set_stream_profiling  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

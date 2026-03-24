@@ -79,11 +79,11 @@ Decode loop (per token):
 
 | Component | Location | Role |
 |-----------|----------|------|
-| `StreamedSwitchGLU` | `src/streaming_qwen/streamed_switch.py` | Replaces mlx-lm's MoE layer; routes each token to the C reader |
-| `ExpertStore` | `src/streaming_qwen/expert_store.py` | Byte-offset index into safetensors shards; `pread()` dispatch |
+| `StreamedSwitchGLU` | `src/streaming_moe/streamed_switch.py` | Replaces mlx-lm's MoE layer; routes each token to the C reader |
+| `ExpertStore` | `src/streaming_moe/expert_store.py` | Byte-offset index into safetensors shards; `pread()` dispatch |
 | `libexpert_reader.dylib` | `native/` | C library: concurrent `pread()`, aligned slab alloc, batch copy |
-| `PersistentPromptCache` | `src/streaming_qwen/server/persistent_cache.py` | LRU KV cache with safetensors disk checkpoints |
-| HTTP server | `src/streaming_qwen/server/http.py` | OpenAI-compatible SSE server with tool calling + multi-turn prefix sharing |
+| `PersistentPromptCache` | `src/streaming_moe/server/persistent_cache.py` | LRU KV cache with safetensors disk checkpoints |
+| HTTP server | `src/streaming_moe/server/http.py` | OpenAI-compatible SSE server with tool calling + multi-turn prefix sharing |
 
 ### MLX / mlx-lm Components Used
 
@@ -212,7 +212,7 @@ KV_CACHE_DIR=.run/kv-cache ./scripts/streamed-qwen-server.sh start
 ./scripts/opencode-streamed-simple.sh
 
 # Non-interactive: run a single prompt and exit (useful for scripts)
-./scripts/opencode-streamed-simple.sh run "Explain the expert routing in src/streaming_qwen/streamed_switch.py"
+./scripts/opencode-streamed-simple.sh run "Explain the expert routing in src/streaming_moe/streamed_switch.py"
 ```
 
 The launcher copies `configs/opencode-streamed-simple.json` into a working directory
@@ -283,7 +283,7 @@ See [docs/openai-compatibility.md](docs/openai-compatibility.md) for the full ch
 ## Repository Layout
 
 ```
-src/streaming_qwen/   Python package — streamed MoE runtime + OpenAI server
+src/streaming_moe/   Python package — streamed MoE runtime + OpenAI server
 native/               C library — pread, slab allocation, batch expert copy
 scripts/              Server launch scripts (shell) + generation entrypoint
 benchmarks/           Decode throughput, component loading, expert cache experiments

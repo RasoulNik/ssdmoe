@@ -29,9 +29,9 @@ import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models import cache
 
-from streaming_qwen.expert_store import ExpertStore
-from streaming_qwen.runtime import build_streamed_model, iter_moe_layers
-from streaming_qwen.streamed_switch import (
+from streaming_moe.expert_store import ExpertStore
+from streaming_moe.runtime import build_streamed_model, iter_moe_layers
+from streaming_moe.streamed_switch import (
     get_expert_trace,
     reset_expert_trace,
     set_expert_tracing,
