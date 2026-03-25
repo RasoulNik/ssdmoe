@@ -176,30 +176,47 @@ Run 35B to speculate the next token AND its expert selections. Prefetch those ex
 - [ ] H=2 post-warmup
 - Artifact: `benchmarks/results/qwen35-122b-cache-benchmark.json`
 
-### Phase 2: Routing Correlation Study
-- [ ] Download Qwen3.5-35B-A3B-4bit (in progress)
-- [ ] Build expert index for 35B
-- [ ] Run `bench_routing_correlation.py`: both models same prompts, measure Jaccard overlap of expert selections per layer per token
-- [ ] Measure zero-shot prediction accuracy: treat 35B selection as prediction of 122B selection
+### Phase 2: Routing Correlation Study ✓ COMPLETE
+- [x] Download Qwen3.5-35B-A3B-4bit
+- [x] Build expert index for 35B: `.run/qwen35-35b-expert-index.json`
+- [x] Run `bench_routing_correlation.py`
 - Artifact: `benchmarks/results/routing-correlation.json`
 
-### Phase 3: Intra-Model Prefetch (Approach A)
-- [ ] Implement `PredictiveStreamedSwitchGLU`: predict next layer's experts from current hidden state
-- [ ] Async pread submit at end of each layer forward
-- [ ] Benchmark vs baseline
-- Artifact: `benchmarks/results/intra-model-prefetch.json`
+**Result: ZERO-SHOT FAILED**
+- Jaccard similarity: 1.7% mean, 0% median
+- Hit rate: 3.2% mean = random chance (8/256 = 3.1%)
+- Expert indices are arbitrary training labels — not aligned across models
+- Even same-family models (Qwen3.5) show no routing correspondence
 
-### Phase 4: Cross-Model Draft Prefetch (Approach B, if routing correlation > 50%)
-- [ ] Implement draft inference loop: 35B runs 1 step ahead
-- [ ] 35B expert selections → prefetch for 122B
-- [ ] Benchmark vs baseline and Approach A
-- Artifact: `benchmarks/results/draft-guided-prefetch.json`
+**Implication**: 35B cannot predict 122B routing without a trained projection. However, a trained linear map (2048→256) using ~4M tokens could achieve 50-70% accuracy (estimated from MoE-SpeQ results).
 
-### Phase 5: Trained Projection (if zero-shot < 50%)
-- [ ] Collect (35B_hidden, 122B_routing) pairs on 4M tokens
-- [ ] Train linear projection: 2048 → 256
-- [ ] Evaluate prediction accuracy
-- [ ] Integrate into prefetch pipeline
+### Phase 3: Intra-Model Next-Layer Prediction ✓ COMPLETE
+- [x] `bench_next_layer_predict.py`: baseline predictor ("same experts as L") → **4.1% hit rate** (random)
+- Artifact: `benchmarks/results/next-layer-prediction.json`
+
+**Trivial predictor fails** — adjacent layers specialize differently. BUT literature achieves 84-97% with:
+- Quasi-hidden state (training-free): layer L hidden + mean(selected experts) → route layer L+1
+- Pre-attention 2-layer linear (2511.10676): 93-97% on Qwen3-30B — **directly applicable**
+
+### Phase 4: Cross-Model Draft Prefetch ✓ COMPLETE (NEGATIVE)
+- [x] `bench_routing_correlation.py`: 35B vs 122B Jaccard = **1.7% mean, 0% median** = random
+- Expert indices are arbitrary training labels — NOT aligned across model sizes
+- Zero-shot fails completely, trained projection would be needed (not yet implemented)
+
+### Phase 5: Next Steps (prioritized by ROI)
+
+**P1 — Native C window cache** (highest ROI, minimal code):
+Implement H=1 cache lookup in `libexpert_reader.dylib` — returns pre-loaded `mx.array` buffers with zero Python dispatch. Expected: 34% hit rate → **2.53 tok/s** (+51% from 1.67).
+
+**P2 — Trained pre-attention predictor** (next-layer prefetch):
+2 linear layers trained on pre-attention activations → 93-97% next-layer routing accuracy.
+Architecture: `linear(hidden_size → hidden_size/4) → silu → linear(→ 256)` trained on ~4M tokens.
+Would allow async pread of layer L+1 experts WHILE layer L GPU compute runs.
+Expected: 90% hit rate → **~10× reduction in SSD reads** → up to 6 tok/s theoretical.
+
+**P3 — Speculative full-token generation**:
+35B generates a speculative token; if 122B verifies same token, expert selections can be reused.
+Feasibility requires measuring token acceptance rate between 35B and 122B on same prompts.
 
 ---
 
@@ -218,11 +235,23 @@ Within 16 GB unified memory. H=2 cache (3.8 GB) pushes to ~11 GB — feasible bu
 
 ---
 
-## 9. Conclusions So Far
+## 9. Conclusions
 
-1. **SSD bandwidth is the hard ceiling**: 1,944 MiB/token at K=8 at 3.4 GB/s = 1.75 tok/s max
-2. **Python-side cache overhead cancels savings**: current session_window_native needs native rewrite
-3. **K reduction is the simplest win**: K=4 → K=8 doubles throughput at same quality (needs quality eval)
-4. **Cross-model prediction is viable**: same 256-expert space in 35B and 122B makes zero-shot routing prediction plausible — to be validated empirically
-5. **Speculative full-token generation** (Approach C) is the highest-potential optimization if token acceptance rate is good
+| Finding | Result |
+|:--|:--|
+| SSD bandwidth ceiling (K=8) | **1.75 tok/s** at 3.4 GB/s — hard physical limit |
+| Baseline decode (K=8) | 1.36 tok/s |
+| Window cache, Python | Slower than baseline (720ms overhead > 520ms SSD) |
+| Window cache, native C (projected) | **2.53 tok/s** at H=1 (+51%), **2.91** at H=2 (+74%) |
+| H=1 routing hit rate | **34%** mean (50%+ in mid/deep layers 24-44) |
+| Cross-model routing (35B→122B) | **3.2%** = random — zero-shot fails completely |
+| Next-layer intra-model (trivial) | **4.1%** = random — trained predictor needed |
+| Trained next-layer predictor (lit.) | **93-97%** accuracy achievable (2 linear layers) |
+
+### Priority Roadmap
+
+1. **Native C window cache** — implement in `libexpert_reader.dylib`. ~2 days. +51% throughput.
+2. **Trained pre-attention predictor** — 2 linear layers, ~4M token training. ~1 week. Up to +6× theoretical.
+3. **Speculative token verification** — 35B draft + 122B verify. Needs token acceptance rate measurement.
+4. **2-bit expert quantization** — halve expert size → halve SSD reads → 2× all of the above.
 

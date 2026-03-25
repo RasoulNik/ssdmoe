@@ -1,0 +1,345 @@
+{
+  "model": "/Users/rasoul/.cache/huggingface/hub/models--mlx-community--Qwen3.5-122B-A10B-4bit/snapshots/e9c67b08899964be5fdd069bb1b4bc8907fe68f5",
+  "tokens": 32,
+  "top_k": 8,
+  "predictor": "same_as_prev_layer",
+  "hit_rate": {
+    "mean": 0.0409856052790416,
+    "median": 0.0
+  },
+  "jaccard": {
+    "mean": 0.022202545070511153,
+    "median": 0.0
+  },
+  "per_pair": [
+    {
+      "layer": 0,
+      "next_layer": 1,
+      "hit_rate": 0.04842180774748924,
+      "jaccard": 0.025961604153856666,
+      "n_tokens": 34
+    },
+    {
+      "layer": 1,
+      "next_layer": 2,
+      "hit_rate": 0.019449715370018973,
+      "jaccard": 0.010318157113591703,
+      "n_tokens": 34
+    },
+    {
+      "layer": 2,
+      "next_layer": 3,
+      "hit_rate": 0.01335139318885449,
+      "jaccard": 0.007219251336898395,
+      "n_tokens": 34
+    },
+    {
+      "layer": 3,
+      "next_layer": 4,
+      "hit_rate": 0.06088593974175036,
+      "jaccard": 0.03328599045251904,
+      "n_tokens": 34
+    },
+    {
+      "layer": 4,
+      "next_layer": 5,
+      "hit_rate": 0.03063725490196078,
+      "jaccard": 0.016714580569069735,
+      "n_tokens": 34
+    },
+    {
+      "layer": 5,
+      "next_layer": 6,
+      "hit_rate": 0.08161764705882353,
+      "jaccard": 0.04517299877697557,
+      "n_tokens": 34
+    },
+    {
+      "layer": 6,
+      "next_layer": 7,
+      "hit_rate": 0.03970588235294118,
+      "jaccard": 0.021155830753353973,
+      "n_tokens": 34
+    },
+    {
+      "layer": 7,
+      "next_layer": 8,
+      "hit_rate": 0.08856951871657753,
+      "jaccard": 0.04938590820943762,
+      "n_tokens": 34
+    },
+    {
+      "layer": 8,
+      "next_layer": 9,
+      "hit_rate": 0.057352941176470586,
+      "jaccard": 0.03132002801120448,
+      "n_tokens": 34
+    },
+    {
+      "layer": 9,
+      "next_layer": 10,
+      "hit_rate": 0.06259426847662142,
+      "jaccard": 0.033794277204552706,
+      "n_tokens": 34
+    },
+    {
+      "layer": 10,
+      "next_layer": 11,
+      "hit_rate": 0.04512032085561497,
+      "jaccard": 0.024557717823971693,
+      "n_tokens": 34
+    },
+    {
+      "layer": 11,
+      "next_layer": 12,
+      "hit_rate": 0.05782988871224165,
+      "jaccard": 0.03067418748321246,
+      "n_tokens": 34
+    },
+    {
+      "layer": 12,
+      "next_layer": 13,
+      "hit_rate": 0.022153092006033184,
+      "jaccard": 0.011875172604252969,
+      "n_tokens": 34
+    },
+    {
+      "layer": 13,
+      "next_layer": 14,
+      "hit_rate": 0.028751885369532427,
+      "jaccard": 0.015315315315315315,
+      "n_tokens": 34
+    },
+    {
+      "layer": 14,
+      "next_layer": 15,
+      "hit_rate": 0.060457516339869274,
+      "jaccard": 0.032178350792371746,
+      "n_tokens": 34
+    },
+    {
+      "layer": 15,
+      "next_layer": 16,
+      "hit_rate": 0.05489056087551299,
+      "jaccard": 0.029998485880838827,
+      "n_tokens": 34
+    },
+    {
+      "layer": 16,
+      "next_layer": 17,
+      "hit_rate": 0.03758169934640523,
+      "jaccard": 0.019948849104859334,
+      "n_tokens": 34
+    },
+    {
+      "layer": 17,
+      "next_layer": 18,
+      "hit_rate": 0.05473856209150327,
+      "jaccard": 0.029741308288021098,
+      "n_tokens": 34
+    },
+    {
+      "layer": 18,
+      "next_layer": 19,
+      "hit_rate": 0.04521065182829889,
+      "jaccard": 0.025107494203192183,
+      "n_tokens": 34
+    },
+    {
+      "layer": 19,
+      "next_layer": 20,
+      "hit_rate": 0.07364800759013282,
+      "jaccard": 0.03965336134453781,
+      "n_tokens": 34
+    },
+    {
+      "layer": 20,
+      "next_layer": 21,
+      "hit_rate": 0.027369281045751634,
+      "jaccard": 0.014630467571644042,
+      "n_tokens": 34
+    },
+    {
+      "layer": 21,
+      "next_layer": 22,
+      "hit_rate": 0.023126185958254268,
+      "jaccard": 0.012175838077166351,
+      "n_tokens": 34
+    },
+    {
+      "layer": 22,
+      "next_layer": 23,
+      "hit_rate": 0.032454361054766734,
+      "jaccard": 0.017234262125902993,
+      "n_tokens": 34
+    },
+    {
+      "layer": 23,
+      "next_layer": 24,
+      "hit_rate": 0.14743914807302233,
+      "jaccard": 0.08061002178649239,
+      "n_tokens": 34
+    },
+    {
+      "layer": 24,
+      "next_layer": 25,
+      "hit_rate": 0.08996539792387542,
+      "jaccard": 0.05004856923854031,
+      "n_tokens": 34
+    },
+    {
+      "layer": 25,
+      "next_layer": 26,
+      "hit_rate": 0.034449891067538124,
+      "jaccard": 0.018165001849796525,
+      "n_tokens": 34
+    },
+    {
+      "layer": 26,
+      "next_layer": 27,
+      "hit_rate": 0.02771493212669683,
+      "jaccard": 0.014828431372549019,
+      "n_tokens": 34
+    },
+    {
+      "layer": 27,
+      "next_layer": 28,
+      "hit_rate": 0.000794912559618442,
+      "jaccard": 0.0004743833017077799,
+      "n_tokens": 34
+    },
+    {
+      "layer": 28,
+      "next_layer": 29,
+      "hit_rate": 0.013970588235294117,
+      "jaccard": 0.007261029411764706,
+      "n_tokens": 34
+    },
+    {
+      "layer": 29,
+      "next_layer": 30,
+      "hit_rate": 0.011274509803921568,
+      "jaccard": 0.006022408963585434,
+      "n_tokens": 34
+    },
+    {
+      "layer": 30,
+      "next_layer": 31,
+      "hit_rate": 0.04656862745098039,
+      "jaccard": 0.024929971988795516,
+      "n_tokens": 34
+    },
+    {
+      "layer": 31,
+      "next_layer": 32,
+      "hit_rate": 0.01577324478178368,
+      "jaccard": 0.00825426944971537,
+      "n_tokens": 34
+    },
+    {
+      "layer": 32,
+      "next_layer": 33,
+      "hit_rate": 0.04618005738880918,
+      "jaccard": 0.025245098039215687,
+      "n_tokens": 34
+    },
+    {
+      "layer": 33,
+      "next_layer": 34,
+      "hit_rate": 0.025735294117647058,
+      "jaccard": 0.013469735720375107,
+      "n_tokens": 34
+    },
+    {
+      "layer": 34,
+      "next_layer": 35,
+      "hit_rate": 0.030479127134724854,
+      "jaccard": 0.016260987153482082,
+      "n_tokens": 34
+    },
+    {
+      "layer": 35,
+      "next_layer": 36,
+      "hit_rate": 0.020561002178649236,
+      "jaccard": 0.01085434173669468,
+      "n_tokens": 34
+    },
+    {
+      "layer": 36,
+      "next_layer": 37,
+      "hit_rate": 0.012079831932773108,
+      "jaccard": 0.006427015250544662,
+      "n_tokens": 34
+    },
+    {
+      "layer": 37,
+      "next_layer": 38,
+      "hit_rate": 0.05732570806100218,
+      "jaccard": 0.0308017546641298,
+      "n_tokens": 34
+    },
+    {
+      "layer": 38,
+      "next_layer": 39,
+      "hit_rate": 0.048742884250474384,
+      "jaccard": 0.026006191950464396,
+      "n_tokens": 34
+    },
+    {
+      "layer": 39,
+      "next_layer": 40,
+      "hit_rate": 0.03783206831119544,
+      "jaccard": 0.020507150228512457,
+      "n_tokens": 34
+    },
+    {
+      "layer": 40,
+      "next_layer": 41,
+      "hit_rate": 0.02853641456582633,
+      "jaccard": 0.015430520034100599,
+      "n_tokens": 34
+    },
+    {
+      "layer": 41,
+      "next_layer": 42,
+      "hit_rate": 0.026785714285714284,
+      "jaccard": 0.015336837075967513,
+      "n_tokens": 34
+    },
+    {
+      "layer": 42,
+      "next_layer": 43,
+      "hit_rate": 0.0351890756302521,
+      "jaccard": 0.018736383442265796,
+      "n_tokens": 34
+    },
+    {
+      "layer": 43,
+      "next_layer": 44,
+      "hit_rate": 0.016377005347593586,
+      "jaccard": 0.00909090909090909,
+      "n_tokens": 34
+    },
+    {
+      "layer": 44,
+      "next_layer": 45,
+      "hit_rate": 0.00606120826709062,
+      "jaccard": 0.0032777290020485805,
+      "n_tokens": 34
+    },
+    {
+      "layer": 45,
+      "next_layer": 46,
+      "hit_rate": 0.029530360531309294,
+      "jaccard": 0.015563725490196075,
+      "n_tokens": 34
+    },
+    {
+      "layer": 46,
+      "next_layer": 47,
+      "hit_rate": 0.05103806228373703,
+      "jaccard": 0.028497714875423852,
+      "n_tokens": 34
+    }
+  ]
+}
