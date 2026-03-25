@@ -18,6 +18,51 @@ from .session_window_cache import SessionWindowNativeCache
 from .streamed_switch import StreamedSwitchGLU
 
 
+class _LatentMoEWrapper(nn.Module):
+    """Wraps NemotronHMoE for models with moe_latent_size (e.g. Nemotron-120B).
+
+    mlx-lm's NemotronHMoE passes the full hidden state (4096-dim) to switch_mlp.
+    The 120B model's experts operate in a latent space (1024-dim): the mixer owns
+    fc1_latent_proj (hidden→latent) and fc2_latent_proj (latent→hidden) around them.
+
+    After _patch_streamed_switches replaces switch_mlp with StreamedSwitchGLU, this
+    wrapper is set as layer.mixer so that model.load_weights() correctly populates
+    fc1_latent_proj and fc2_latent_proj via the standard path-based mechanism.
+    """
+
+    def __init__(self, original_moe, hidden_size: int, latent_size: int):
+        super().__init__()
+        self.switch_mlp = original_moe.switch_mlp      # StreamedSwitchGLU
+        self.gate = original_moe.gate
+        self.shared_experts = getattr(original_moe, "shared_experts", None)
+        # Placeholder shapes — replaced by model.load_weights() with quantized weights
+        self.fc1_latent_proj = nn.Linear(hidden_size, latent_size, bias=False)
+        self.fc2_latent_proj = nn.Linear(latent_size, hidden_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        inds, scores = self.gate(x)
+        x_lat = self.fc1_latent_proj(x)                                # [B, latent]
+        y = self.switch_mlp(x_lat, inds)                               # [B, K, latent]
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)       # [B, latent]
+        y = self.fc2_latent_proj(y)                                    # [B, hidden]
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(x)
+        return y
+
+
+def _wrap_latent_moe_layers(model, config: dict) -> None:
+    """Replace NemotronHMoE mixers with _LatentMoEWrapper when moe_latent_size is set."""
+    latent_size = config.get("moe_latent_size")
+    if not latent_size:
+        return
+    hidden_size = config.get("hidden_size")
+    text_model = getattr(getattr(model, "language_model", model), "model", model)
+    for layer in text_model.layers:
+        mixer = getattr(layer, "mixer", None)
+        if mixer is not None and hasattr(mixer, "switch_mlp"):
+            layer.mixer = _LatentMoEWrapper(mixer, hidden_size, latent_size)
+
+
 def _get_moe_module(layer):
     """Return (moe_module, set_top_k) for a layer, or (None, None) if not a MoE layer.
 
@@ -87,6 +132,7 @@ def _patch_streamed_switches(
                 group_size=quantization.get("group_size", 64),
                 bits=quantization.get("bits", 4),
                 mode=quantization.get("mode", "affine"),
+                activation=activation,
                 fused_gate_up=fused_gate_up,
                 compile_fused_gate_up=compile_fused_gate_up,
             )
@@ -187,6 +233,10 @@ def build_streamed_model(
             session_cache=session_cache,
             activation=activation,
         )
+        # For models with moe_latent_size (e.g. Nemotron-120B): inject latent projection
+        # wrappers so that fc1_latent_proj / fc2_latent_proj weights are registered as
+        # proper module paths and loaded correctly by model.load_weights().
+        _wrap_latent_moe_layers(model, config)
     _quantize_resident_modules(model, config, available_weight_names)
 
     weights = load_non_expert_text_weights(model_path)

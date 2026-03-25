@@ -44,6 +44,7 @@ class PipelinedStreamedSwitchGLU(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         mode: str = "affine",
+        activation: str = "swiglu",
         fused_gate_up: bool = False,
         compile_fused_gate_up: bool = False,
     ):
@@ -53,6 +54,7 @@ class PipelinedStreamedSwitchGLU(nn.Module):
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
+        self.activation = activation
         self.fused_gate_up = fused_gate_up
         self.compile_fused_gate_up = compile_fused_gate_up
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -114,6 +116,7 @@ class PipelinedStreamedSwitchGLU(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
+            activation=self.activation,
             fused_gate_up=self.fused_gate_up,
             compile_fused_gate_up=self.compile_fused_gate_up,
         )
