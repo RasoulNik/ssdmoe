@@ -1,8 +1,14 @@
-"""Prefetching StreamedSwitchGLU that overlaps I/O with compute.
+"""Prefetching StreamedSwitchGLU — cross-token expert prefetch.
 
-This module implements a prefetch strategy where experts for the next
-forward pass are loaded asynchronously while the current forward pass
-is computing.
+Key insight for hybrid models (e.g. Nemotron-120B):
+
+  Token T, layer N:  experts loaded synchronously → submit_prefetch(same experts)
+  Token T+1, Mamba:  GPU runs ~40ms of Mamba layers (lazy eval flush)
+  Token T+1, layer N: prefetch cache hit → IO already done!
+                      (pread took ~10ms, Mamba took ~40ms → free overlap)
+
+The prefetch is speculative — same experts as last time.  Expert routing tends
+to be stable during autoregressive decode so hit-rate is high in practice.
 """
 from __future__ import annotations
 
@@ -113,11 +119,11 @@ class PrefetchManager:
 
 
 class PrefetchingStreamedSwitchGLU(nn.Module):
-    """StreamedSwitchGLU with prefetching support.
+    """StreamedSwitchGLU with cross-token expert prefetch.
 
-    Key optimization: After computing routing for layer N, we submit a prefetch
-    request for the same layer. On the next token, if the same experts are
-    selected (common in autoregressive generation), the data is already loaded.
+    After each forward call, immediately submits a background pread for the
+    same experts.  On the next token, those experts are likely already in
+    memory by the time the GPU finishes its Mamba layers.
     """
 
     def __init__(
@@ -128,6 +134,7 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
         group_size: int = 64,
         bits: int = 4,
         mode: str = "affine",
+        activation: str = "swiglu",
         fused_gate_up: bool = False,
         compile_fused_gate_up: bool = False,
     ):
@@ -138,9 +145,17 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
+        self.activation = activation
         self.fused_gate_up = fused_gate_up
         self.compile_fused_gate_up = compile_fused_gate_up
-        # Track last selected experts for speculation
+
+        # Cache per-layer constants (avoid recomputing every token)
+        self._layer_info = expert_store.expert_reads[str(layer_idx)]
+        self._streamed_components = [
+            c for c in self._layer_info
+            if not expert_store.has_resident_component(layer_idx, c)
+        ]
+
         self._last_selected: list[int] = []
         self._stats = {
             "prefetch_used": 0,
@@ -149,24 +164,21 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
 
     def _load_selected(self, selected_experts: list[int]) -> dict[str, mx.array]:
         """Load selected experts, using prefetch if available."""
-        layer_info = self.expert_store.expert_reads[str(self.layer_idx)]
-        streamed_components = [
-            c for c in layer_info
-            if not self.expert_store.has_resident_component(self.layer_idx, c)
-        ]
+        layer_info = self._layer_info
+        streamed_components = self._streamed_components
 
-        # Try to get from prefetch cache
+        # Try cross-token prefetch cache (opportunistic — no wait on miss)
         payload = None
         if self.prefetch_manager is not None:
             payload = self.prefetch_manager.get_prefetched(
-                self.layer_idx, selected_experts, timeout=0.001
+                self.layer_idx, selected_experts, timeout=0.0
             )
             if payload is not None:
                 self._stats["prefetch_used"] += 1
             else:
                 self._stats["prefetch_missed"] += 1
 
-        # If not prefetched, load synchronously
+        # Synchronous load on miss
         if payload is None:
             t0 = time.perf_counter()
             if self.expert_store.native_reader is not None:
@@ -183,8 +195,7 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
                 )
             STREAM_STATS["load_seconds"] += time.perf_counter() - t0
 
-        # Submit prefetch for next time (same layer, same experts)
-        # This helps when the same experts are selected across tokens
+        # Submit prefetch for next token (speculation: same experts selected again)
         if self.prefetch_manager is not None:
             self.prefetch_manager.submit_prefetch(
                 self.layer_idx, selected_experts, streamed_components
@@ -222,9 +233,8 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
 
         local_indices = _remap_indices(indices_np, selected_np)
         STREAM_STATS["remap_seconds"] += time.perf_counter() - t0
-        tensors = self._load_selected(selected)
 
-        # Store for speculation
+        tensors = self._load_selected(selected)
         self._last_selected = selected
 
         return _compute_expert_output(
@@ -234,6 +244,7 @@ class PrefetchingStreamedSwitchGLU(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
+            activation=self.activation,
             fused_gate_up=self.fused_gate_up,
             compile_fused_gate_up=self.compile_fused_gate_up,
         )

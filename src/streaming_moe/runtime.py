@@ -132,6 +132,7 @@ def _patch_streamed_switches(
                 group_size=quantization.get("group_size", 64),
                 bits=quantization.get("bits", 4),
                 mode=quantization.get("mode", "affine"),
+                activation=activation,
                 fused_gate_up=fused_gate_up,
                 compile_fused_gate_up=compile_fused_gate_up,
             )
