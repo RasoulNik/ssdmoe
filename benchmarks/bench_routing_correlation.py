@@ -9,6 +9,13 @@ If overlap is high (>50%), the 35B model can serve as a draft router —
 running 1 token ahead and prefetching the likely 122B experts before the
 122B model needs them, hiding the SSD read latency.
 
+Layer alignment strategy (STRUCTURAL, not proportional):
+  Both models share identical group structure: [linear, linear, linear, full_attention] × N
+    35B:  10 groups × 4 layers = 40 layers  → groups 0–9  (absolute layers 0–39)
+    122B: 12 groups × 4 layers = 48 layers  → groups 0–11 (absolute layers 0–47)
+  Mapping: 35B layer i → 122B layer i  (identity, for i=0..39)
+  Unmatched: 122B layers 40–47 have no 35B counterpart (tail groups 10–11)
+
 Usage:
   poetry run python benchmarks/bench_routing_correlation.py \\
     --model-large  ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-122B-A10B-4bit/snapshots/... \\
@@ -143,20 +150,26 @@ def main():
     large_tokens = run_decode(model_large, tok_large, args.prompt, args.tokens, args.routed_top_k)
     print(f"  Generated: {tok_large.decode(large_tokens[:16])} …")
 
-    # ── Align layers ──
-    # 35B has 40 MoE layers, 122B has 48. Map by relative depth:
-    # small_layer → large_layer = round(small_layer * 48/40)
+    # ── Align layers (STRUCTURAL mapping) ──
+    # Both models share the same group pattern: [linear, linear, linear, full_attn] × N
+    #   35B:  10 groups = 40 layers (0–39)
+    #   122B: 12 groups = 48 layers (0–47)
+    # Correct mapping: 35B layer i → 122B layer i  (identity for i=0..39)
+    # 122B layers 40–47 are unmatched (tail groups 10–11 have no 35B counterpart).
     n_large = len(large_layers)
     n_small = len(small_layers)
-    ratio = n_large / n_small
 
-    # Build layer alignment map
+    # Build structural layer alignment map: identity where possible
+    # small_layers and large_layers are sorted lists of MoE layer indices
+    # Since all layers are MoE in both models, small_layers = [0..39], large_layers = [0..47]
+    large_layer_set = set(large_layers)
     layer_map: list[tuple[int, int]] = []
-    for si, sl in enumerate(small_layers):
-        li_float = si * ratio
-        li = min(round(li_float), len(large_layers) - 1)
-        ll = large_layers[li]
-        layer_map.append((sl, ll))
+    unmatched_large: list[int] = []
+    for sl in small_layers:
+        if sl in large_layer_set:
+            layer_map.append((sl, sl))   # same absolute index
+        # (if 35B had a layer not in 122B, we'd skip — shouldn't happen here)
+    unmatched_large = [ll for ll in large_layers if ll not in {sl for sl, _ in layer_map}]
 
     # ── Compute routing correlation ──
     # For each aligned layer pair, compute per-token Jaccard between
@@ -201,8 +214,10 @@ def main():
     # ── Print results ──
     print("\n" + "═" * 65)
     print("Cross-model expert routing correlation (35B → 122B)")
+    print("  Mapping: STRUCTURAL (35B layer i → 122B layer i, identity)")
     print("─" * 65)
-    print(f"  Aligned layer pairs:         {len(per_layer_jaccard)}")
+    print(f"  Aligned layer pairs:         {len(per_layer_jaccard)}  (35B layers 0–{small_layers[-1]})")
+    print(f"  Unmatched 122B tail layers:  {len(unmatched_large)}  (layers {unmatched_large[0]}–{unmatched_large[-1]} → no 35B coverage)")
     print(f"  Tokens compared per layer:   ~{per_layer_jaccard[0][3] if per_layer_jaccard else 0}")
     print()
     print(f"  Jaccard similarity (set overlap):")
@@ -253,6 +268,9 @@ def main():
         "top_k": args.routed_top_k,
         "large_moe_layers": n_large,
         "small_moe_layers": n_small,
+        "layer_alignment": "structural_identity",
+        "aligned_pairs": len(layer_map),
+        "unmatched_large_layers": unmatched_large,
         "jaccard": {
             "mean": float(np.mean(all_jaccards)),
             "median": float(np.median(all_jaccards)),
