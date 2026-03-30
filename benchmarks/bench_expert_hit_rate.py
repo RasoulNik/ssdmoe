@@ -18,16 +18,18 @@ import sys
 from pathlib import Path
 from collections import defaultdict
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.loader import ensure_src_path
+ensure_src_path()
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from mlx_lm.models.cache import make_prompt_cache
 
+from lib.hooks import install_recording_hooks
+from lib.report import BenchReport, Table, Row
 from streaming_moe.runtime import build_streamed_model, set_routed_top_k
-from streaming_moe.streamed_switch import StreamedSwitchGLU
-from streaming_moe.prefetch_switch import PrefetchingStreamedSwitchGLU
 
 
 def parse_args():
@@ -39,49 +41,9 @@ def parse_args():
     p.add_argument("--routed-top-k", type=int, default=8)
     p.add_argument("--component-workers", type=int, default=3)
     p.add_argument("--prompt", default="Explain how neural networks work in detail.")
+    p.add_argument("--ssd-gbps", type=float, default=3.4, help="Measured SSD read bandwidth in GB/s")
+    p.add_argument("--output", default=None, help="JSON output path")
     return p.parse_args()
-
-
-# ─── Recording hook ────────────────────────────────────────────────────────────
-
-# selections[layer_idx] = list of frozenset per token (decode order)
-_selections: dict[int, list[frozenset]] = defaultdict(list)
-_token_counter = 0
-
-
-class _RecordingSwitch(nn.Module):
-    """Thin wrapper that records expert selections then delegates to the real switch."""
-
-    def __init__(self, inner, layer_idx: int):
-        super().__init__()
-        self._inner = inner
-        self._layer_idx = layer_idx
-
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        indices_np = np.array(indices.tolist(), dtype=np.int32)
-        selected = frozenset(np.unique(indices_np).tolist())
-        _selections[self._layer_idx].append(selected)
-        # Re-create indices as mx.array so the inner switch can call tolist() again
-        return self._inner(x, indices)
-
-
-def install_recording_hooks(model) -> list[int]:
-    """Replace all StreamedSwitchGLU layers with _RecordingSwitch wrappers.
-    Returns list of layer indices that were patched."""
-    from streaming_moe.runtime import _get_moe_module
-    text_model = getattr(getattr(model, "language_model", model), "model", model)
-    patched = []
-    for i, layer in enumerate(text_model.layers):
-        moe_module, _ = _get_moe_module(layer)
-        if moe_module is None:
-            continue
-        switch = getattr(moe_module, "switch_mlp", None)
-        if switch is None:
-            continue
-        if isinstance(switch, (StreamedSwitchGLU, PrefetchingStreamedSwitchGLU)):
-            moe_module.switch_mlp = _RecordingSwitch(switch, i)
-            patched.append(i)
-    return patched
 
 
 # ─── Main ──────────────────────────────────────────────────────────────────────
@@ -97,7 +59,8 @@ def main():
         component_workers=args.component_workers,
     )
     set_routed_top_k(model, args.routed_top_k)
-    patched_layers = install_recording_hooks(model)
+    _selections: dict[int, list] = defaultdict(list)
+    patched_layers = install_recording_hooks(model, _selections)
     print(f"Hooked {len(patched_layers)} MoE layers: {patched_layers[:5]}…\n")
 
     # ── Prefill ──
@@ -124,118 +87,146 @@ def main():
 
     print(f"Collected {n} decode tokens across {len(patched_layers)} MoE layers.\n")
 
-    # ── Compute hit rates ──
-    # Per-layer hit rate: fraction of consecutive token pairs that selected the same experts
-    layer_hit_rates = {}
-    for layer_idx in patched_layers:
-        sel = _selections[layer_idx]
-        if len(sel) < 2:
-            continue
-        hits = sum(1 for a, b in zip(sel, sel[1:]) if a == b)
-        layer_hit_rates[layer_idx] = hits / (len(sel) - 1)
-
-    if not layer_hit_rates:
+    if not any(_selections[l] for l in patched_layers):
         print("No data collected.")
         return
 
-    rates = list(layer_hit_rates.values())
-    mean_rate = np.mean(rates)
-    median_rate = np.median(rates)
-    min_rate = np.min(rates)
-    max_rate = np.max(rates)
+    # ── Window cache hit-rate analysis ──
+    # For window H: cache = union of expert sets from the last H tokens at this layer.
+    # Hit rate = |current ∩ cache| / |current|
+    # "How many of the K experts I need now are already in RAM from the last H tokens?"
+    WINDOWS = [1, 2]
 
-    print("═" * 60)
-    print("Cross-token expert selection hit rate (same experts → cache hit)")
-    print("─" * 60)
-    print(f"  Mean:    {mean_rate*100:5.1f}%")
-    print(f"  Median:  {median_rate*100:5.1f}%")
-    print(f"  Min:     {min_rate*100:5.1f}%")
-    print(f"  Max:     {max_rate*100:5.1f}%")
-    print()
+    window_hits: dict[int, list[float]] = {H: [] for H in WINDOWS}
+    window_hits_per_layer: dict[int, dict[int, list[float]]] = {H: {} for H in WINDOWS}
 
-    # Per-layer table (show every 5th layer to keep output concise)
-    print("Per-layer hit rate (sample):")
-    print(f"  {'Layer':>6}  {'Tokens':>6}  {'Hit%':>6}  {'Unique sets':>11}")
-    print("  " + "-" * 34)
-    for layer_idx in patched_layers[::4]:
-        sel = _selections[layer_idx]
-        hr = layer_hit_rates.get(layer_idx, 0)
-        n_unique = len(set(sel))
-        print(f"  {layer_idx:>6}  {len(sel):>6}  {hr*100:>5.1f}%  {n_unique:>11}")
-    print()
-
-    # ── Jaccard similarity (partial overlap) ──
-    # Even when the set isn't identical, how much do they overlap?
-    all_jaccard = []
     for layer_idx in patched_layers:
         sel = _selections[layer_idx]
-        for a, b in zip(sel, sel[1:]):
-            if not a and not b:
-                continue
-            jaccard = len(a & b) / len(a | b) if (a | b) else 1.0
-            all_jaccard.append(jaccard)
-    if all_jaccard:
-        print(f"Jaccard similarity between consecutive tokens (partial overlap):")
-        print(f"  Mean:    {np.mean(all_jaccard)*100:5.1f}%")
-        print(f"  Median:  {np.median(all_jaccard)*100:5.1f}%")
-        print(f"  Min:     {np.min(all_jaccard)*100:5.1f}%")
-        print()
+        for H in WINDOWS:
+            fracs = []
+            for t in range(H, len(sel)):
+                current = sel[t]
+                cache = frozenset().union(*sel[t - H: t])
+                if current:
+                    fracs.append(len(current & cache) / len(current))
+            window_hits[H].extend(fracs)
+            window_hits_per_layer[H][layer_idx] = fracs
 
-    # ── SSD read volume math ──
-    # Get expert size from expert_store
+    # ── Gather SSD geometry ──
+    window_means: dict[int, float] = {}
     try:
-        n_moe_layers = len(patched_layers)
-        k = args.routed_top_k
-        # Sample one layer's component info to estimate expert size
         sample_layer = str(patched_layers[0])
         layer_info = expert_store.expert_reads[sample_layer]
-        # expert_size is the per-expert byte count; sum across all streamed components
         bytes_per_expert = sum(info.get("expert_size", 0) for info in layer_info.values())
-        mb_per_expert = bytes_per_expert / 1e6
-        mib_per_token = (n_moe_layers * k * bytes_per_expert) / 2**20
-        gb_per_token = (n_moe_layers * k * bytes_per_expert) / 1e9
+        n_moe = len(patched_layers)
+        k = args.routed_top_k
+    except Exception:
+        bytes_per_expert = 0; n_moe = 0; k = 0
 
-        print("═" * 60)
-        print("SSD read volume per decode token")
-        print("─" * 60)
-        print(f"  MoE layers:          {n_moe_layers}")
-        print(f"  Top-K experts:       {k}")
-        print(f"  Expert size:         {mb_per_expert:.2f} MB ({bytes_per_expert/1024:.0f} KB)")
-        print(f"  Total per token:     {gb_per_token*1000:.0f} MB  ({mib_per_token:.0f} MiB)")
-        print()
+    # ── Summary table rows ──
+    summary_rows: list[Row] = []
+    window_raw: dict = {}
+    for H in WINDOWS:
+        fracs = window_hits[H]
+        if not fracs:
+            continue
+        mean_h = float(np.mean(fracs))
+        med_h  = float(np.median(fracs))
+        min_h  = float(np.min(fracs))
+        max_h  = float(np.max(fracs))
+        window_means[H] = mean_h
+        cache_mb = H * n_moe * k * bytes_per_expert / 1e6 if bytes_per_expert else 0
+        summary_rows.append(Row([
+            f"H={H}",
+            f"{mean_h*100:.1f}%",
+            f"{med_h*100:.1f}%",
+            f"{min_h*100:.1f}%",
+            f"{max_h*100:.1f}%",
+            f"{cache_mb:.0f} MB",
+        ]))
+        window_raw[H] = {"mean": mean_h, "median": med_h, "min": min_h, "max": max_h,
+                         "cache_mb": cache_mb}
 
-        # At various SSD bandwidths
-        for bw_gbps, label in [(3.0, "slow SSD"), (3.4, "typical M4"), (6.0, "fast NVMe")]:
-            ms = gb_per_token / bw_gbps * 1000
+    # ── Per-layer breakdown rows ──
+    layer_rows: list[Row] = []
+    layer_raw: dict = {}
+    for layer_idx in patched_layers[::4]:
+        sel = _selections[layer_idx]
+        h1 = window_hits_per_layer[1].get(layer_idx, [])
+        h2 = window_hits_per_layer[2].get(layer_idx, [])
+        n_unique = len(set(sel))
+        r1 = f"{np.mean(h1)*100:.1f}%" if h1 else "—"
+        r2 = f"{np.mean(h2)*100:.1f}%" if h2 else "—"
+        layer_rows.append(Row([str(layer_idx), r1, r2, f"{n_unique}/{len(sel)}"]))
+        layer_raw[layer_idx] = {"h1": float(np.mean(h1)) if h1 else None,
+                                 "h2": float(np.mean(h2)) if h2 else None}
+
+    # ── SSD savings rows ──
+    ssd_rows: list[Row] = []
+    ssd_raw: dict = {}
+    notes: list[str] = []
+    if bytes_per_expert:
+        gb_per_token = (n_moe * k * bytes_per_expert) / 1e9
+        bw = args.ssd_gbps
+        ms_base = gb_per_token / bw * 1000
+        ssd_rows.append(Row(["Baseline", f"{gb_per_token*1000:.0f} MB/tok",
+                              f"{ms_base:.0f} ms", f"{1000/ms_base:.2f} tok/s", ""]))
+        ssd_raw["baseline"] = {"gb_per_token": gb_per_token, "ms": ms_base,
+                                "tps": 1000/ms_base}
+        for H in WINDOWS:
+            hit = window_means.get(H, 0)
+            eff_gb = gb_per_token * (1 - hit)
+            ms = eff_gb / bw * 1000 if eff_gb > 0 else 1
             tps = 1000 / ms
-            print(f"  @ {bw_gbps} GB/s ({label:12s}): {ms:.0f} ms/token  ({tps:.2f} tok/s SSD-limited)")
+            cache_mb = H * n_moe * k * bytes_per_expert / 1e6
+            ssd_rows.append(Row([
+                f"H={H} cache",
+                f"{eff_gb*1000:.0f} MB/tok",
+                f"{ms:.0f} ms",
+                f"{tps:.2f} tok/s",
+                f"cache={cache_mb:.0f} MB, hit={hit*100:.0f}%",
+            ]))
+            ssd_raw[f"h{H}"] = {"gb_per_token": eff_gb, "ms": ms, "tps": tps,
+                                  "cache_mb": cache_mb, "hit_rate": hit}
+        notes = [
+            "NOTE: current Python cache overhead negates these gains.",
+            "A native C cache lookup would recover the full saving.",
+        ]
 
-        print()
-        eff_hit = mean_rate  # fraction of (layer, token) pairs that are cache hits
-        read_reduction = eff_hit  # if hit, no pread needed
-        effective_gb = gb_per_token * (1 - read_reduction)
-        if effective_gb > 0:
-            ms_with_cache = effective_gb / 3.4 * 1000
-            print(f"  With {mean_rate*100:.0f}% hit rate + perfect cross-token cache:")
-            print(f"    Effective read:  {effective_gb*1000:.0f} MB/token")
-            print(f"    SSD time:        {ms_with_cache:.0f} ms/token")
-        else:
-            print(f"  With {mean_rate*100:.0f}% hit rate: all reads eliminated!")
-    except Exception as e:
-        print(f"  (could not compute SSD math: {e})")
-
-    print()
-    print("═" * 60)
-    print("Interpretation")
-    print("─" * 60)
-    if mean_rate > 0.7:
-        print(f"  Hit rate {mean_rate*100:.0f}% is HIGH → cross-token expert cache would help.")
-        print(f"  GIL-free native prefetch could potentially eliminate most SSD latency.")
-    elif mean_rate > 0.3:
-        print(f"  Hit rate {mean_rate*100:.0f}% is MODERATE → cache helps but SSD reads remain.")
-    else:
-        print(f"  Hit rate {mean_rate*100:.0f}% is LOW → experts change frequently, cache barely helps.")
-        print(f"  SSD reads are unavoidable at current routing diversity.")
+    report = BenchReport(
+        title="Window cache hit rate — fraction of K experts already in RAM cache",
+        subtitle="Cache = union of expert sets from last H decode tokens per layer",
+        tables=[
+            Table(
+                title="Summary",
+                headers=["Window", "Mean%", "Median%", "Min%", "Max%", "RAM cost"],
+                rows=summary_rows,
+            ),
+            Table(
+                title="Per-layer hit rate (every 4th layer)",
+                headers=["Layer", "H=1 hit%", "H=2 hit%", "Unique/tok"],
+                rows=layer_rows,
+            ),
+            Table(
+                title=f"Projected SSD savings  (SSD bandwidth = {args.ssd_gbps} GB/s)",
+                headers=["Scenario", "MB/tok", "ms/tok", "tok/s", ""],
+                rows=ssd_rows,
+            ),
+        ],
+        notes=notes,
+        raw={
+            "model": args.model,
+            "n_tokens": n,
+            "n_moe_layers": n_moe,
+            "top_k": k,
+            "ssd_gbps": args.ssd_gbps,
+            "windows": window_raw,
+            "per_layer": layer_raw,
+            "ssd_savings": ssd_raw,
+        },
+    )
+    report.print_terminal()
+    report.save_json(args.output)
 
 
 if __name__ == "__main__":

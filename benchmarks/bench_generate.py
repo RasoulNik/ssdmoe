@@ -25,9 +25,10 @@ import argparse
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.loader import save_json  # noqa: E402
+from lib.loader import ensure_src_path, save_json  # noqa: E402
+ensure_src_path()
 
 import mlx.core as mx  # noqa: E402
 from mlx_lm.generate import stream_generate  # noqa: E402

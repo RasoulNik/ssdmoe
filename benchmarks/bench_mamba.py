@@ -17,7 +17,9 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.loader import ensure_src_path
+ensure_src_path()
 
 import mlx.core as mx
 import numpy as np

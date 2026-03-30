@@ -20,22 +20,22 @@ import argparse
 import json
 import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.loader import ensure_src_path
+ensure_src_path()
 
 import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models import cache
 
+from lib.decode import prefill as _lib_prefill
+from lib.hooks import install_recording_hooks
 from streaming_moe.expert_store import ExpertStore
-from streaming_moe.runtime import build_streamed_model, iter_moe_layers
-from streaming_moe.streamed_switch import (
-    get_expert_trace,
-    reset_expert_trace,
-    set_expert_tracing,
-)
+from streaming_moe.runtime import build_streamed_model
 
 
 def parse_args() -> argparse.Namespace:
@@ -96,25 +96,6 @@ def encode_prompt(tokenizer, prompt: str) -> list[int]:
     return tokenizer.encode(prompt)
 
 
-def prefill_prompt(
-    model,
-    prompt_tokens: list[int],
-    prompt_cache,
-    prefill_step_size: int,
-) -> mx.array:
-    prompt = mx.array(prompt_tokens, dtype=mx.uint32)
-    if prompt.size <= 1:
-        return prompt
-
-    remaining = prompt[:-1]
-    while remaining.size > 0:
-        n_to_process = min(prefill_step_size, remaining.size)
-        model(remaining[:n_to_process][None], cache=prompt_cache)
-        mx.eval([c.state for c in prompt_cache])
-        remaining = remaining[n_to_process:]
-        mx.clear_cache()
-    return prompt[-1:]
-
 
 def collect_decode_trace(
     model,
@@ -123,47 +104,42 @@ def collect_decode_trace(
     max_tokens: int,
     prefill_step_size: int,
 ) -> tuple[list[list[set[int]]], dict]:
+    record_dict: defaultdict = defaultdict(list)
+    patched_layers = install_recording_hooks(model, record_dict)
+    num_layers = len(patched_layers)
+
     prompt_tokens = encode_prompt(tokenizer, prompt)
     prompt_cache = cache.make_prompt_cache(model)
-    last_prompt_token = prefill_prompt(
+    last_prompt_token = _lib_prefill(
         model=model,
         prompt_tokens=prompt_tokens,
         prompt_cache=prompt_cache,
-        prefill_step_size=prefill_step_size,
+        step_size=prefill_step_size,
     )
 
-    reset_expert_trace()
-    set_expert_tracing(True)
     generated = []
     eos_ids = set(getattr(tokenizer, "eos_token_ids", []) or [])
-    try:
-        token_gen = generate_step(
-            last_prompt_token,
-            model,
-            max_tokens=max_tokens,
-            prompt_cache=prompt_cache,
-            prefill_step_size=prefill_step_size,
-        )
-        for token, _logprobs in token_gen:
-            generated.append(int(token))
-            if int(token) in eos_ids:
-                break
-    finally:
-        set_expert_tracing(False)
+    token_gen = generate_step(
+        last_prompt_token,
+        model,
+        max_tokens=max_tokens,
+        prompt_cache=prompt_cache,
+        prefill_step_size=prefill_step_size,
+    )
+    for token, _logprobs in token_gen:
+        generated.append(int(token))
+        if int(token) in eos_ids:
+            break
 
-    trace = get_expert_trace()
-    num_layers = len(list(iter_moe_layers(model)))
-    if not trace:
+    if not record_dict:
         raise RuntimeError("No expert trace was collected")
-    if len(trace) % num_layers != 0:
-        raise RuntimeError(
-            f"Trace length {len(trace)} is not divisible by num_layers {num_layers}"
-        )
 
-    steps: list[list[set[int]]] = []
-    for i in range(0, len(trace), num_layers):
-        chunk = trace[i : i + num_layers]
-        steps.append([set(entry["selected_experts"]) for entry in chunk])
+    n_tokens = len(record_dict[patched_layers[0]])
+    # Convert {layer: [frozenset, ...]} → [[set_layer0, set_layer1, ...], ...]
+    steps: list[list[set[int]]] = [
+        [set(record_dict[l][t]) for l in patched_layers]
+        for t in range(n_tokens)
+    ]
 
     return steps, {
         "prompt_tokens": len(prompt_tokens),

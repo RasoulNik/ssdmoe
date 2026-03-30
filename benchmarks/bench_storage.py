@@ -35,9 +35,10 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.loader import save_json  # noqa: E402
+from lib.loader import ensure_src_path, save_json  # noqa: E402
+ensure_src_path()
 
 from streaming_moe.expert_store import ExpertStore  # noqa: E402
 

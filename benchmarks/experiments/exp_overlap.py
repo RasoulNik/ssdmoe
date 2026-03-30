@@ -15,11 +15,15 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.loader import ensure_src_path
+ensure_src_path()
 
 import mlx.core as mx
 import numpy as np
 
+from lib.index import load_index_config
 from streaming_moe.expert_store import ExpertStore
 from streaming_moe.runtime import build_streamed_model
 
@@ -138,6 +142,8 @@ def main():
 
     try:
         results = []
+        n_moe = load_index_config(Path(args.index)).n_moe_layers
+        test_layers = [0, n_moe // 2, n_moe - 1]
         # Test different numbers of experts
         for k in [2, 4, 8]:
             print(f"\nTesting K={k}...")
@@ -145,7 +151,7 @@ def main():
             expert_indices = list(range(k))
 
             # Test a few layers
-            for layer_idx in [0, 20, 39]:
+            for layer_idx in test_layers:
                 print(f"  Layer {layer_idx}...")
                 result = measure_io_gpu_overlap(
                     expert_store,
