@@ -1,4 +1,5 @@
 .run
+.dev/
 .external/
 .venv/
 .open-webui-venv/
