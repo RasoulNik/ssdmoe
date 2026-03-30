@@ -32,9 +32,11 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from lib.loader import parse_bytes, save_json  # noqa: E402
+from lib.loader import ensure_src_path, parse_bytes, save_json  # noqa: E402
+ensure_src_path()
+from lib.decode import prefill as _prefill  # noqa: E402
 
 import mlx.core as mx  # noqa: E402
 from mlx_lm.generate import generate_step  # noqa: E402
@@ -82,19 +84,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", default=None, help="JSON output path")
     return p.parse_args()
 
-
-def _prefill(model, prompt_tokens, prompt_cache, step_size):
-    prompt = mx.array(prompt_tokens, dtype=mx.uint32)
-    if prompt.size <= 1:
-        return prompt
-    remaining = prompt[:-1]
-    while remaining.size > 0:
-        n = min(step_size, remaining.size)
-        model(remaining[:n][None], cache=prompt_cache)
-        mx.eval([c.state for c in prompt_cache])
-        remaining = remaining[n:]
-        mx.clear_cache()
-    return prompt[-1:]
 
 
 def _tps_after_skip(times, started, skip):

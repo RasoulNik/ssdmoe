@@ -27,14 +27,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
 
-N_EXPERTS = 256
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.mapper import CoOccurrenceMapper, SlidingWindowMapper  # noqa: E402
+
 CHECKPOINTS = [50, 100, 200, 500, 1000, 2000, 4000, 8000]
-
-
 WINDOW_SIZES = [50, 100]  # sliding window sizes to evaluate
 
 
@@ -46,109 +47,10 @@ def parse_args():
                    help="Subset of layers to report (default: every 4th)")
     p.add_argument("--window-sizes", type=int, nargs="*", default=WINDOW_SIZES,
                    help="Sliding window sizes for context-aware mapper")
+    p.add_argument("--n-experts", type=int, default=None,
+                   help="Number of experts (read from npz metadata if not specified)")
     return p.parse_args()
 
-
-class CoOccurrenceMapper:
-    """W[i,j] = times 35B expert-i co-activated with 122B expert-j at same token."""
-
-    def __init__(self, layer: int, k: int = 8):
-        self.layer = layer
-        self.k = k
-        self.W = np.zeros((N_EXPERTS, N_EXPERTS), dtype=np.float64)
-        self.n = 0
-
-    def update_batch(self, s_small: np.ndarray, s_large: np.ndarray) -> None:
-        """s_small, s_large: (n_tok, K) int arrays."""
-        # Vectorised outer-product accumulation
-        for s, lg in zip(s_small, s_large):
-            for i in s:
-                for j in lg:
-                    self.W[i, j] += 1.0
-        self.n += len(s_small)
-
-    def predict(self, s_small: np.ndarray) -> np.ndarray:
-        """s_small: (K,) int array.  Returns top-K predicted 122B expert indices."""
-        scores = self.W[s_small].sum(axis=0)
-        # Normalise each row to avoid bias toward high-frequency 35B experts
-        row_sums = self.W[s_small].sum(axis=1, keepdims=True)
-        mask = row_sums.squeeze() > 0
-        if mask.any():
-            normed = np.where(row_sums > 0, self.W[s_small] / (row_sums + 1e-12), 0)
-            scores = normed.sum(axis=0)
-        return np.argpartition(scores, -self.k)[-self.k:]
-
-    def hit_rate_batch(self, s_small: np.ndarray, s_large: np.ndarray) -> np.ndarray:
-        """Returns per-token hit rates: |predicted ∩ actual| / |actual|."""
-        hits = []
-        for s, lg in zip(s_small, s_large):
-            if len(lg) == 0:
-                continue
-            pred = set(self.predict(s).tolist())
-            hits.append(len(pred & set(lg.tolist())) / len(lg))
-        return np.array(hits, dtype=np.float32)
-
-    def sparsity(self) -> float:
-        return float(np.count_nonzero(self.W)) / self.W.size
-
-
-class SlidingWindowMapper:
-    """Context-aware mapper using only the last W tokens of co-occurrence.
-
-    Instead of accumulating all history, maintains a circular buffer of the
-    last W (35B, 122B) pairs and rebuilds W on each prediction from that window.
-
-    At inference time this means: to predict the next token's 122B experts,
-    use only the mapping seen in the last W tokens — which reflects the current
-    topic/context rather than the global average.
-    """
-
-    def __init__(self, layer: int, window: int, k: int = 8):
-        self.layer = layer
-        self.window = window
-        self.k = k
-        # Circular buffers: (W, K) int32
-        self._buf_s = np.zeros((window, k), dtype=np.int32)
-        self._buf_l = np.zeros((window, k), dtype=np.int32)
-        self._head = 0      # next write position
-        self._filled = 0    # number of valid entries
-
-    def update(self, s: np.ndarray, lg: np.ndarray) -> None:
-        """Add one token pair (K,) each."""
-        self._buf_s[self._head] = s
-        self._buf_l[self._head] = lg
-        self._head = (self._head + 1) % self.window
-        self._filled = min(self._filled + 1, self.window)
-
-    def _build_W(self) -> np.ndarray:
-        if self._filled == 0:
-            return np.zeros((N_EXPERTS, N_EXPERTS), dtype=np.float32)
-        n = self._filled
-        W = np.zeros((N_EXPERTS, N_EXPERTS), dtype=np.float32)
-        # Indices of valid entries (oldest first)
-        if self._filled < self.window:
-            indices = range(self._filled)
-        else:
-            indices = [(self._head + i) % self.window for i in range(self.window)]
-        for idx in indices:
-            for i in self._buf_s[idx]:
-                for j in self._buf_l[idx]:
-                    W[i, j] += 1.0
-        return W
-
-    def predict(self, s: np.ndarray) -> np.ndarray:
-        W = self._build_W()
-        scores = W[s].sum(axis=0)
-        row_sums = W[s].sum(axis=1, keepdims=True)
-        if (row_sums > 0).any():
-            normed = np.where(row_sums > 0, W[s] / (row_sums + 1e-12), 0)
-            scores = normed.sum(axis=0)
-        return np.argpartition(scores, -self.k)[-self.k:]
-
-    def hit_rate(self, s: np.ndarray, lg: np.ndarray) -> float:
-        if len(lg) == 0: return 0.0
-        pred = set(self.predict(s).tolist())
-        return len(pred & set(lg.tolist())) / len(lg)
 
 
 def load_topic_data(data_dir: Path, tag: str, topic_id: int, topic_name: str,
@@ -191,17 +93,24 @@ def main():
     npz_122b = np.load(first_122b[0])
     layers_35b = sorted(int(k.split("_")[1]) for k in npz_35b.files if k.startswith("layer_"))
     layers_122b = sorted(int(k.split("_")[1]) for k in npz_122b.files if k.startswith("layer_"))
-    k = int(npz_35b["meta_n_tokens"])  # just to get K from shape
     sample_arr = npz_35b[f"layer_{layers_35b[0]}"]
     top_k = sample_arr.shape[1]
+
+    # n_experts: prefer CLI arg, then npz metadata, then 256 as fallback
+    if args.n_experts is not None:
+        n_experts = args.n_experts
+    elif "meta_n_experts" in npz_35b.files:
+        n_experts = int(npz_35b["meta_n_experts"][0])
+    else:
+        n_experts = 256
 
     # Aligned layer pairs: identity mapping for shared layers
     shared_layers = sorted(set(layers_35b) & set(layers_122b))
     unmatched_122b = sorted(set(layers_122b) - set(shared_layers))
     print(f"Aligned layer pairs: {len(shared_layers)}  (layers {shared_layers[0]}–{shared_layers[-1]})")
     print(f"Unmatched 122B tail: {len(unmatched_122b)} layers  ({unmatched_122b[0] if unmatched_122b else '—'}–{unmatched_122b[-1] if unmatched_122b else '—'})")
-    print(f"Top-K: {top_k},  N_experts: {N_EXPERTS}")
-    print(f"Random baseline: {top_k/N_EXPERTS*100:.1f}%")
+    print(f"Top-K: {top_k},  N_experts: {n_experts}")
+    print(f"Random baseline: {top_k/n_experts*100:.1f}%")
 
     # Layers to report in detail
     if args.layers:
@@ -248,12 +157,14 @@ def main():
     print(f"\nTotal: {total_train} train tokens, {total_test} test tokens", flush=True)
 
     # ── Train mappers and evaluate at checkpoints ──
-    mappers: dict[int, CoOccurrenceMapper] = {l: CoOccurrenceMapper(l, top_k) for l in shared_layers}
+    mappers: dict[int, CoOccurrenceMapper] = {
+        l: CoOccurrenceMapper(l, n_experts, top_k) for l in shared_layers
+    }
     # Window mappers: trained token-by-token on train set, evaluated on test set
     # (test set evaluation uses window state at the END of training — simulates
     #  online inference where recent context is from the current conversation)
     window_mappers: dict[int, dict[int, SlidingWindowMapper]] = {
-        W: {l: SlidingWindowMapper(l, W, top_k) for l in shared_layers}
+        W: {l: SlidingWindowMapper(l, W, n_experts, top_k) for l in shared_layers}
         for W in args.window_sizes
     }
     checkpoints = [c for c in CHECKPOINTS if c <= total_train]
@@ -262,7 +173,7 @@ def main():
 
     # Print header
     layer_cols = "  ".join(f"L{l:02d}" for l in report_layers)
-    print(f"\n{'tokens':>8}  {layer_cols}  ← test hit%  (random={top_k/N_EXPERTS*100:.1f}%)")
+    print(f"\n{'tokens':>8}  {layer_cols}  ← test hit%  (random={top_k/n_experts*100:.1f}%)")
     print("─" * (10 + 7 * len(report_layers)))
 
     checkpoint_results: list[dict] = []
@@ -332,7 +243,7 @@ def main():
         win_str = "  ".join(win_means)
         print(f"{l:>6}  {global_mean*100:>7.1f}%  {win_str}  {mappers[l].sparsity()*100:>6.1f}%")
 
-    print(f"\n  Random baseline: {top_k/N_EXPERTS*100:.1f}%")
+    print(f"\n  Random baseline: {top_k/n_experts*100:.1f}%")
     print(f"  Unmatched 122B layers (no 35B): {unmatched_122b}")
 
     # ── Save results ──
@@ -342,8 +253,8 @@ def main():
         "total_train_tokens": total_train,
         "total_test_tokens": total_test,
         "top_k": top_k,
-        "n_experts": N_EXPERTS,
-        "random_baseline": top_k / N_EXPERTS,
+        "n_experts": n_experts,
+        "random_baseline": top_k / n_experts,
         "aligned_layers": shared_layers,
         "unmatched_122b_layers": unmatched_122b,
         "window_sizes": args.window_sizes,

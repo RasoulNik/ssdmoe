@@ -25,6 +25,12 @@ Usage:
   poetry run python benchmarks/bench_expert_mapper.py train \
     --small .run/selections-35b.npz \
     --large .run/selections-122b.npz
+
+Deprecated: prefer the two-step pipeline for production use:
+  1. benchmarks/collect_expert_data.py  -- collect per-token selections for all layers
+  2. benchmarks/train_expert_mapper.py  -- train CoOccurrenceMapper + SlidingWindowMapper
+
+This file remains useful for quick online sessions (collect + train in one command).
 """
 from __future__ import annotations
 
@@ -34,11 +40,12 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lib.loader import ensure_src_path
+ensure_src_path()
 
 import numpy as np
 
-N_EXPERTS = 256
 PROBE_LAYERS = [0, 12, 24, 36]
 CHECKPOINTS = [50, 100, 200, 300, 500]
 
@@ -69,6 +76,7 @@ def collect(args):
     from streaming_moe.runtime import build_streamed_model, set_routed_top_k
     from streaming_moe.streamed_switch import StreamedSwitchGLU
     from streaming_moe.prefetch_switch import PrefetchingStreamedSwitchGLU
+    from lib.index import load_index_config
 
     probe_set = set(args.probe_layers)
     selections: dict[int, list[list[int]]] = defaultdict(list)  # layer → [token_selections]
@@ -82,6 +90,9 @@ def collect(args):
             idx = np.array(indices.tolist(), dtype=np.int16)
             selections[self._l].append(sorted(np.unique(idx).tolist()))
             return self._inner(x, indices)
+
+    idx_cfg = load_index_config(Path(args.index))
+    n_experts = idx_cfg.n_experts
 
     print(f"Loading model {Path(args.model).name[:40]} …", flush=True)
     model, tokenizer, _, _ = build_streamed_model(
@@ -145,7 +156,7 @@ def collect(args):
             arr[t, :len(s_arr)] = s_arr
         save_dict[f"layer_{l}"] = arr
     save_dict["meta_top_k"] = np.array([args.top_k])
-    save_dict["meta_n_experts"] = np.array([N_EXPERTS])
+    save_dict["meta_n_experts"] = np.array([n_experts])
     np.savez(out, **save_dict)
     print(f"\nSaved {token_count} tokens × {len(probe_set)} layers → {out}", flush=True)
 
@@ -154,6 +165,7 @@ def collect(args):
 
 class CoOccurrenceMapper:
     def __init__(self, n_experts=256, top_k=8):
+        self.n_experts = n_experts
         self.W = np.zeros((n_experts, n_experts), dtype=np.float32)
         self.n = 0
         self.top_k = top_k
@@ -166,7 +178,7 @@ class CoOccurrenceMapper:
 
     def predict(self, s_small: list[int]) -> set[int]:
         if self.n == 0: return set()
-        scores = np.zeros(N_EXPERTS, dtype=np.float32)
+        scores = np.zeros(self.n_experts, dtype=np.float32)
         for i in s_small:
             row = self.W[i]
             s = row.sum()
@@ -189,11 +201,12 @@ def train(args):
     large = np.load(args.large)
 
     top_k = int(small["meta_top_k"][0])
+    n_experts = int(small["meta_n_experts"][0]) if "meta_n_experts" in small.files else 256
     layers = [int(k.split("_")[1]) for k in small.files if k.startswith("layer_")]
     layers = sorted(l for l in layers if f"layer_{l}" in large.files)
-    print(f"Layers: {layers},  top_k={top_k}", flush=True)
+    print(f"Layers: {layers},  top_k={top_k},  n_experts={n_experts}", flush=True)
 
-    mappers = {l: CoOccurrenceMapper(N_EXPERTS, top_k) for l in layers}
+    mappers = {l: CoOccurrenceMapper(n_experts, top_k) for l in layers}
 
     n_tokens = min(small[f"layer_{layers[0]}"].shape[0],
                    large[f"layer_{layers[0]}"].shape[0])
@@ -209,7 +222,7 @@ def train(args):
     next_cp = 0
 
     print(f"\n{'tokens':>8}  " + "  ".join(f"L{l:02d} hit%" for l in layers) +
-          f"  (random={top_k/N_EXPERTS*100:.1f}%)", flush=True)
+          f"  (random={top_k/n_experts*100:.1f}%)", flush=True)
     print("─" * (8 + 12 * len(layers)), flush=True)
 
     for t in range(n_tokens):
@@ -248,21 +261,21 @@ def train(args):
 
     # Final summary
     print(f"\n{'═'*60}", flush=True)
-    print(f"Random baseline: {top_k/N_EXPERTS*100:.1f}%  (K={top_k}/{N_EXPERTS})", flush=True)
+    print(f"Random baseline: {top_k/n_experts*100:.1f}%  (K={top_k}/{n_experts})", flush=True)
     print(f"W matrix sparsity per layer:", flush=True)
     for l in layers:
         sp = mappers[l].w_sparsity()
-        print(f"  Layer {l:>2}: {sp*100:.1f}% of {N_EXPERTS}×{N_EXPERTS} entries nonzero  "
-              f"(fully uniform=100%, perfect sparse permutation≈{top_k/N_EXPERTS*100:.1f}%)", flush=True)
+        print(f"  Layer {l:>2}: {sp*100:.1f}% of {n_experts}×{n_experts} entries nonzero  "
+              f"(fully uniform=100%, perfect sparse permutation≈{top_k/n_experts*100:.1f}%)", flush=True)
 
     # Save results
     results = {
         "small_file": str(args.small),
         "large_file": str(args.large),
         "top_k": top_k,
-        "n_experts": N_EXPERTS,
+        "n_experts": n_experts,
         "layers": layers,
-        "random_baseline": top_k / N_EXPERTS,
+        "random_baseline": top_k / n_experts,
         "checkpoints": checkpoint_results,
     }
     out = Path(args.output)

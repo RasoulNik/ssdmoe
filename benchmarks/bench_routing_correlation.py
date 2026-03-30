@@ -28,21 +28,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from lib.loader import ensure_src_path
+ensure_src_path()
 
 import mlx.core as mx
-import mlx.nn as nn
 import numpy as np
 from mlx_lm.models.cache import make_prompt_cache
 
+from lib.hooks import install_recording_hooks
+from lib.decode import run_decode
+from lib.report import BenchReport, Table, Row
 from streaming_moe.runtime import build_streamed_model, set_routed_top_k
-from streaming_moe.streamed_switch import StreamedSwitchGLU
-from streaming_moe.prefetch_switch import PrefetchingStreamedSwitchGLU
 
 
 def parse_args():
@@ -57,63 +59,10 @@ def parse_args():
     p.add_argument("--component-workers", type=int, default=3)
     p.add_argument("--prompt", default="Explain how neural networks learn from data.")
     p.add_argument("--output", default=None, help="JSON output path")
+    p.add_argument("--ssd-gbps", type=float, default=3.4, help="Measured SSD read bandwidth in GB/s")
     return p.parse_args()
 
 
-# ── Recording hook ────────────────────────────────────────────────────────────
-
-class _RecordingSwitch(nn.Module):
-    """Thin wrapper recording expert selections, then delegating to real switch."""
-    def __init__(self, inner, layer_idx: int, record_dict: dict):
-        super().__init__()
-        self._inner = inner
-        self._layer_idx = layer_idx
-        self._record = record_dict  # layer_idx → list of frozenset
-
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        indices_np = np.array(indices.tolist(), dtype=np.int32)
-        selected = frozenset(np.unique(indices_np).tolist())
-        self._record[self._layer_idx].append(selected)
-        return self._inner(x, indices)
-
-
-def install_hooks(model, record_dict: dict) -> list[int]:
-    from streaming_moe.runtime import _get_moe_module
-    text_model = getattr(getattr(model, "language_model", model), "model", model)
-    patched = []
-    for i, layer in enumerate(text_model.layers):
-        moe_module, _ = _get_moe_module(layer)
-        if moe_module is None:
-            continue
-        switch = getattr(moe_module, "switch_mlp", None)
-        if switch is None:
-            continue
-        if isinstance(switch, (StreamedSwitchGLU, PrefetchingStreamedSwitchGLU)):
-            moe_module.switch_mlp = _RecordingSwitch(switch, i, record_dict)
-            patched.append(i)
-    return patched
-
-
-def run_decode(model, tokenizer, prompt: str, n_tokens: int, top_k: int) -> list[int]:
-    """Prefill + decode n_tokens, return generated token ids."""
-    from mlx_lm.generate import generate_step
-    set_routed_top_k(model, top_k)
-    tokens = tokenizer.encode(prompt)
-    prompt_arr = mx.array(tokens, dtype=mx.uint32)
-    cache = make_prompt_cache(model)
-    if prompt_arr.size > 1:
-        model(prompt_arr[:-1][None], cache=cache)
-        mx.eval([c.state for c in cache])
-    last = prompt_arr[-1:]
-    eos_ids = set(getattr(tokenizer, "eos_token_ids", []) or [])
-    generated = []
-    for token, _ in generate_step(last, model, max_tokens=n_tokens, prompt_cache=cache):
-        mx.eval(token)
-        tid = int(token)
-        generated.append(tid)
-        if tid in eos_ids:
-            break
-    return generated
 
 
 def main():
@@ -127,7 +76,7 @@ def main():
         native_reader_path=Path(args.native_reader),
         component_workers=args.component_workers,
     )
-    large_layers = install_hooks(model_large, large_selections)
+    large_layers = install_recording_hooks(model_large, large_selections)
     print(f"  Hooked {len(large_layers)} MoE layers.")
 
     print("Loading 35B model …")
@@ -137,7 +86,7 @@ def main():
         native_reader_path=Path(args.native_reader),
         component_workers=args.component_workers,
     )
-    small_layers = install_hooks(model_small, small_selections)
+    small_layers = install_recording_hooks(model_small, small_selections)
     print(f"  Hooked {len(small_layers)} MoE layers.")
 
     # ── Run both models on same prompt ──
@@ -211,61 +160,34 @@ def main():
                 hr = len(s_sel[t] & l_sel[t]) / len(l_sel[t])
                 hit_rates.append(hr)
 
-    # ── Print results ──
-    print("\n" + "═" * 65)
-    print("Cross-model expert routing correlation (35B → 122B)")
-    print("  Mapping: STRUCTURAL (35B layer i → 122B layer i, identity)")
-    print("─" * 65)
-    print(f"  Aligned layer pairs:         {len(per_layer_jaccard)}  (35B layers 0–{small_layers[-1]})")
-    print(f"  Unmatched 122B tail layers:  {len(unmatched_large)}  (layers {unmatched_large[0]}–{unmatched_large[-1]} → no 35B coverage)")
-    print(f"  Tokens compared per layer:   ~{per_layer_jaccard[0][3] if per_layer_jaccard else 0}")
-    print()
-    print(f"  Jaccard similarity (set overlap):")
-    print(f"    Mean:   {np.mean(all_jaccards)*100:5.1f}%")
-    print(f"    Median: {np.median(all_jaccards)*100:5.1f}%")
-    print(f"    Min:    {np.min(all_jaccards)*100:5.1f}%")
-    print(f"    Max:    {np.max(all_jaccards)*100:5.1f}%")
-    print()
-    print(f"  Zero-shot hit rate (35B predicts 122B):")
-    print(f"    Mean:   {np.mean(hit_rates)*100:5.1f}%  — fraction of 122B experts correctly predicted")
-    print(f"    Median: {np.median(hit_rates)*100:5.1f}%")
-
-    # ── Per-layer table ──
-    print()
-    print("Per-layer Jaccard (sample, every 4th aligned pair):")
-    print(f"  {'35B layer':>10}  {'122B layer':>10}  {'Jaccard':>8}  {'n_tok':>6}")
-    print("  " + "─" * 40)
-    for i, (sl, ll, mj, n) in enumerate(per_layer_jaccard[::4]):
-        print(f"  {sl:>10}  {ll:>10}  {mj*100:>7.1f}%  {n:>6}")
-
-    # ── SSD savings estimate ──
+    # ── Compute SSD savings ──
     mean_hit = float(np.mean(hit_rates))
     sample_layer = str(large_layers[0])
     layer_info = store_large.expert_reads[sample_layer]
     bytes_per_expert = sum(info.get("expert_size", 0) for info in layer_info.values())
     gb_per_token = (n_large * args.routed_top_k * bytes_per_expert) / 1e9
-
-    print()
-    print("─" * 65)
-    print(f"  Expert size (122B): {bytes_per_expert/1e6:.2f} MB")
-    print(f"  SSD/token baseline: {gb_per_token*1000:.0f} MB")
     effective_gb = gb_per_token * (1 - mean_hit)
-    ms_with = effective_gb / 3.4 * 1000
-    print(f"  With {mean_hit*100:.0f}% hit rate (perfect prefetch): {effective_gb*1000:.0f} MB/tok → {ms_with:.0f} ms → ~{1000/ms_with:.2f} tok/s")
-    print()
+    ms_with = effective_gb / args.ssd_gbps * 1000
+    ms_base = gb_per_token / args.ssd_gbps * 1000
     if mean_hit > 0.6:
-        print("  ✓ STRONG correlation — 35B can serve as effective draft router")
+        verdict = "STRONG — 35B can serve as effective draft router"
     elif mean_hit > 0.35:
-        print("  ~ MODERATE correlation — worth training a lightweight projector")
+        verdict = "MODERATE — worth training a lightweight projector"
     else:
-        print("  ✗ WEAK correlation — cross-model routing not viable zero-shot")
+        verdict = "WEAK — cross-model routing not viable zero-shot"
 
-    # ── Save results ──
+    # ── Per-layer table rows ──
+    layer_rows = [
+        Row([str(sl), str(ll), f"{mj*100:.1f}%", str(n)])
+        for sl, ll, mj, n in per_layer_jaccard[::4]
+    ]
+
     results = {
         "large_model": args.model_large,
         "small_model": args.model_small,
         "n_tokens": args.tokens,
         "top_k": args.routed_top_k,
+        "ssd_gbps": args.ssd_gbps,
         "large_moe_layers": n_large,
         "small_moe_layers": n_small,
         "layer_alignment": "structural_identity",
@@ -281,17 +203,65 @@ def main():
             "mean": float(np.mean(hit_rates)),
             "median": float(np.median(hit_rates)),
         },
+        "ssd_savings": {
+            "baseline_gb_per_tok": gb_per_token,
+            "baseline_ms": ms_base,
+            "with_prefetch_gb_per_tok": effective_gb,
+            "with_prefetch_ms": ms_with,
+            "with_prefetch_tps": 1000 / ms_with if ms_with > 0 else 0,
+        },
         "per_layer": [
             {"small_layer": sl, "large_layer": ll, "jaccard": mj, "n_tokens": n}
             for sl, ll, mj, n in per_layer_jaccard
         ],
     }
 
+    report = BenchReport(
+        title="Cross-model expert routing correlation (35B → 122B)",
+        subtitle="Mapping: STRUCTURAL  (35B layer i → 122B layer i, identity)",
+        tables=[
+            Table(
+                title="Jaccard similarity (set overlap) + hit rate",
+                headers=["Metric", "Mean%", "Median%", "Min%", "Max%"],
+                rows=[
+                    Row(["Jaccard",
+                         f"{np.mean(all_jaccards)*100:.1f}%",
+                         f"{np.median(all_jaccards)*100:.1f}%",
+                         f"{np.min(all_jaccards)*100:.1f}%",
+                         f"{np.max(all_jaccards)*100:.1f}%"]),
+                    Row(["Hit rate",
+                         f"{np.mean(hit_rates)*100:.1f}%",
+                         f"{np.median(hit_rates)*100:.1f}%", "—", "—"],
+                        highlight=(mean_hit > 0.35)),
+                ],
+            ),
+            Table(
+                title="Per-layer Jaccard (every 4th aligned pair)",
+                headers=["35B layer", "122B layer", "Jaccard", "n_tok"],
+                rows=layer_rows,
+            ),
+            Table(
+                title=f"SSD prefetch savings  (SSD bandwidth = {args.ssd_gbps} GB/s)",
+                headers=["Scenario", "MB/tok", "ms/tok", "tok/s"],
+                rows=[
+                    Row(["Baseline",
+                         f"{gb_per_token*1000:.0f} MB",
+                         f"{ms_base:.0f} ms",
+                         f"{1000/ms_base:.2f}"]),
+                    Row([f"With {mean_hit*100:.0f}% prefetch",
+                         f"{effective_gb*1000:.0f} MB",
+                         f"{ms_with:.0f} ms",
+                         f"{1000/ms_with:.2f}" if ms_with > 0 else "∞"],
+                        highlight=True),
+                ],
+            ),
+        ],
+        notes=[f"Verdict: {verdict}"],
+        raw=results,
+    )
+    report.print_terminal()
     out = args.output or "benchmarks/results/routing-correlation.json"
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"Results saved to {out}")
+    report.save_json(out)
 
 
 if __name__ == "__main__":

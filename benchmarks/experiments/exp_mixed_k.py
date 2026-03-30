@@ -11,11 +11,15 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from lib.loader import ensure_src_path
+ensure_src_path()
 
 import mlx.core as mx
 from mlx_lm.generate import stream_generate
 
+from lib.index import load_index_config
 from streaming_moe.runtime import build_streamed_model
 from streaming_moe.streamed_switch import (
     STREAM_STATS,
@@ -64,15 +68,18 @@ def main():
     # Configuration for mixed K experiments
     # Format: (name, k1_layers, k2_layers) where k1_layers use K=1, k2_layers use K=2
     # All other layers default to K=2
-    num_layers = 40
+    num_layers = load_index_config(Path(args.index)).n_moe_layers
+    half = num_layers // 2
+    tail5 = min(5, half)
     experiments = [
         ("uniform-k2", [], list(range(num_layers))),  # All K=2 (baseline)
         ("uniform-k1", list(range(num_layers)), []),  # All K=1
-        ("first-half-k1", list(range(20)), list(range(20, 40))),  # First 20 K=1, rest K=2
-        ("last-half-k1", list(range(20, 40)), list(range(20))),  # Last 20 K=1, first 20 K=2
-        ("alternate-k1k2", list(range(0, 40, 2)), list(range(1, 40, 2))),  # Alternating
-        ("every-4th-k2", [i for i in range(40) if i % 4 != 0], [i for i in range(40) if i % 4 == 0]),  # Every 4th is K=2
-        ("first-last-5-k2", list(range(5, 35)), [0,1,2,3,4,35,36,37,38,39]),  # First and last 5 are K=2
+        ("first-half-k1", list(range(half)), list(range(half, num_layers))),  # First half K=1, rest K=2
+        ("last-half-k1", list(range(half, num_layers)), list(range(half))),  # Last half K=1, first half K=2
+        ("alternate-k1k2", list(range(0, num_layers, 2)), list(range(1, num_layers, 2))),  # Alternating
+        ("every-4th-k2", [i for i in range(num_layers) if i % 4 != 0], [i for i in range(num_layers) if i % 4 == 0]),
+        ("first-last-5-k2", list(range(tail5, num_layers - tail5)),
+         list(range(tail5)) + list(range(num_layers - tail5, num_layers))),
     ]
 
     for name, k1_layers, k2_layers in experiments:
