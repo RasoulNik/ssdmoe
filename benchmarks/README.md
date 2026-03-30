@@ -203,7 +203,7 @@ Adding a new model requires only building its index — no script changes needed
 
 ```bash
 # 1. Build the expert index
-poetry run python tools/build_moe_index.py \
+ssdmoe-build-index \
   --model <path> --output .run/<name>-expert-index.json
 
 # 2. Verify raw SSD throughput

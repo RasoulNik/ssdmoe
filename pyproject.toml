@@ -11,6 +11,9 @@ dependencies = [
     "mlx-lm (>=0.31.1,<0.32.0)"
 ]
 
+[project.scripts]
+ssdmoe-build-index = "streaming_moe.build_index:main"
+
 [tool.poetry]
 packages = [{include = "streaming_moe", from = "src"}]
 

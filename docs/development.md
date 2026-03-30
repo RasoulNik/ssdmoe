@@ -22,7 +22,7 @@ make -C native
 make -C native install   # copies dylibs to .run/
 
 # Build the expert byte-offset index (one-time, ~30 seconds)
-poetry run python tools/build_qwen_moe_index.py \
+ssdmoe-build-index \
   --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/<hash> \
   --output .run/qwen35b-expert-index.json
 ```

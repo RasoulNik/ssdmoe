@@ -8,7 +8,7 @@ Supports:
     backbone.layers.{layer}.mixer.switch_mlp.{fc1,fc2}.*
 
 Usage:
-  poetry run python tools/build_moe_index.py \\
+  ssdmoe-build-index \\
     --model ~/.cache/huggingface/hub/models--mlx-community--NVIDIA-Nemotron-3-Nano-30B-A3B-4bit/snapshots/<hash> \\
     --output .run/nemotron30b-expert-index.json
 """

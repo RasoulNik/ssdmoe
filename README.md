@@ -153,11 +153,11 @@ poetry install
 make -C native && make -C native install
 
 # 3. Build the expert byte-offset index (one-time, ~30 s per model)
-poetry run python tools/build_moe_index.py \
+ssdmoe-build-index \
   --model ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-35B-A3B-4bit/snapshots/1e20fd8d42056f870933bf98ca6211024744f7ec \
   --output .run/qwen35b-expert-index.json
 
-poetry run python tools/build_moe_index.py \
+ssdmoe-build-index \
   --model ~/.cache/huggingface/hub/models--mlx-community--NVIDIA-Nemotron-3-Nano-30B-A3B-4bit/snapshots/832f602eba5d22436c258c1462bdedc5afddb42b \
   --output .run/nemotron30b-expert-index.json
 
@@ -270,7 +270,7 @@ scripts/              Server launch scripts (.sh) + generation entrypoint
 benchmarks/           Decode throughput, storage bandwidth, window cache experiments
   experiments/        Exploratory experiment scripts
   lib/                Shared loader utilities
-tools/                build_moe_index.py — one-time expert index generation
+src/streaming_moe/   Core inference engine + build_index.py (one-time index builder)
 docs/                 Architecture, model comparison, experiment log, development guide
 configs/              OpenCode agent configuration
 ```

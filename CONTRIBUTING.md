@@ -13,7 +13,7 @@
 ```bash
 poetry install
 make -C native && make -C native install
-poetry run python tools/build_qwen_moe_index.py \
+ssdmoe-build-index \
   --model <model_path> --output .run/qwen35b-expert-index.json
 ```
 

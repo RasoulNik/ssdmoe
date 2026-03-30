@@ -1,7 +1,7 @@
 """Model-agnostic constants from expert_index.json.
 
 All per-model numbers (n_experts, n_moe_layers, top_k, bytes per expert) are
-stored in the index built by tools/build_moe_index.py.  Scripts should read
+stored in the index built by ssdmoe-build-index (streaming_moe.build_index).  Scripts should read
 from here rather than hardcoding 35B- or 122B-specific values.
 
 Usage:
@@ -44,7 +44,7 @@ class IndexConfig:
 
 
 def load_index_config(index_path: Path) -> IndexConfig:
-    """Parse an expert_index.json produced by tools/build_moe_index.py."""
+    """Parse an expert_index.json produced by ssdmoe-build-index (streaming_moe.build_index)."""
     with Path(index_path).open() as f:
         idx = json.load(f)
     cfg = idx.get("config", {})
